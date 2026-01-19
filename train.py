@@ -74,12 +74,14 @@ def train(opt):
     grl_optimizer = None
     
     if opt.use_grl:
-        # Determine input channels based on model size
-        in_channels = 256  # Default for yolov8n
-        if 's' in opt.weights: in_channels = 256
-        if 'm' in opt.weights: in_channels = 512
-        if 'l' in opt.weights: in_channels = 512
-        if 'x' in opt.weights: in_channels = 640
+        # Auto-detect in_channels from actual forward pass
+        feature_hook = YOLOv8FeatureHook(model_student, layer_idx=9)
+        
+        with torch.no_grad():
+            test_img = torch.zeros(1, 3, opt.imgsz, opt.imgsz, device=device)
+            _ = model_student(test_img)
+            test_feat = feature_hook.get_features()
+            in_channels = test_feat.shape[1] if test_feat is not None else 256
         
         domain_discriminator = DomainDiscriminator(
             in_channels=in_channels,
@@ -87,11 +89,9 @@ def train(opt):
             dropout=0.3
         ).to(device)
         
-        # Register hook on backbone output (layer 9 for YOLOv8)
-        feature_hook = YOLOv8FeatureHook(model_student, layer_idx=9)
         grl_optimizer = optim.Adam(domain_discriminator.parameters(), lr=1e-4)
         
-        LOGGER.info(f'{colorstr("GRL:")} Initialized with {in_channels} channels')
+        LOGGER.info(f'{colorstr("GRL:")} Initialized with {in_channels} channels (auto-detected)')
     
     # ========================================================================
     # OPTIMIZER & SCHEDULER
@@ -369,16 +369,27 @@ def train(opt):
             # ================================================================
             scaler.scale(loss).backward()
             
+            # Gradient clipping for stability
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model_student.parameters(), max_norm=10.0)
+            
             # ================================================================
-            # OPTIMIZER STEP
+            # OPTIMIZER STEP (correct order: all step() before update())
             # ================================================================
             scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
             
             # Update GRL optimizer (with scaler for mixed precision)
             if opt.use_grl and epoch >= opt.grl_warmup and grl_optimizer:
+                scaler.unscale_(grl_optimizer)
+                torch.nn.utils.clip_grad_norm_(domain_discriminator.parameters(), max_norm=10.0)
                 scaler.step(grl_optimizer)
+            
+            # Update scaler AFTER all step() calls
+            scaler.update()
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            if opt.use_grl and grl_optimizer:
                 grl_optimizer.zero_grad()
             
             # Update teacher with EMA
