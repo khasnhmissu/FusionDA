@@ -1,0 +1,4 @@
+train_source_real: path/to/source_real
+train_source_fake: path/to/source_fake  
+train_target_real: path/to/target_real
+train_target_fake: path/to/target_fake

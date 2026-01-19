@@ -107,17 +107,27 @@ def train(opt):
     # ========================================================================
     root = Path(data_dict.get('path', ''))
     
-    # Source domain paths
+    # Source domain paths (real + fake)
     source_real = data_dict.get('train_source_real', data_dict.get('train', []))
     if isinstance(source_real, str):
         source_real = [source_real]
     source_real = [str(root / p) for p in source_real]
     
-    # Target domain paths
+    source_fake = data_dict.get('train_source_fake', [])
+    if isinstance(source_fake, str):
+        source_fake = [source_fake]
+    source_fake = [str(root / p) for p in source_fake] if source_fake else []
+    
+    # Target domain paths (real + fake)
     target_real = data_dict.get('train_target_real', [])
     if isinstance(target_real, str):
         target_real = [target_real]
     target_real = [str(root / p) for p in target_real]
+    
+    target_fake = data_dict.get('train_target_fake', [])
+    if isinstance(target_fake, str):
+        target_fake = [target_fake]
+    target_fake = [str(root / p) for p in target_fake] if target_fake else []
     
     # Test path
     test_real = data_dict.get('test_target_real', data_dict.get('test', []))
@@ -125,8 +135,10 @@ def train(opt):
         test_real = [test_real]
     test_real = [str(root / p) for p in test_real]
     
-    LOGGER.info(f'Source: {source_real}')
-    LOGGER.info(f'Target: {target_real}')
+    LOGGER.info(f'Source Real: {source_real}')
+    LOGGER.info(f'Source Fake: {source_fake}')
+    LOGGER.info(f'Target Real: {target_real}')
+    LOGGER.info(f'Target Fake: {target_fake}')
     
     # Build dataloaders using Ultralytics
     from ultralytics.data import build_dataloader, build_yolo_dataset
@@ -144,7 +156,7 @@ def train(opt):
     )
     source_loader = build_dataloader(source_dataset, opt.batch, opt.workers, shuffle=True)
     
-    # Target dataloader
+    # Target Real dataloader
     if target_real:
         target_dataset = build_yolo_dataset(
             yolo_student.overrides,
@@ -158,7 +170,35 @@ def train(opt):
     else:
         target_loader = source_loader  # Fallback
     
-    nb = max(len(source_loader), len(target_loader))
+    # Source Fake dataloader
+    if source_fake:
+        source_fake_dataset = build_yolo_dataset(
+            yolo_student.overrides,
+            img_path=source_fake[0],
+            batch=opt.batch,
+            data=data_dict,
+            mode='train',
+            stride=gs,
+        )
+        source_fake_loader = build_dataloader(source_fake_dataset, opt.batch, opt.workers, shuffle=True)
+    else:
+        source_fake_loader = source_loader  # Fallback to source real
+    
+    # Target Fake dataloader
+    if target_fake:
+        target_fake_dataset = build_yolo_dataset(
+            yolo_student.overrides,
+            img_path=target_fake[0],
+            batch=opt.batch,
+            data=data_dict,
+            mode='train',
+            stride=gs,
+        )
+        target_fake_loader = build_dataloader(target_fake_dataset, opt.batch, opt.workers, shuffle=True)
+    else:
+        target_fake_loader = target_loader  # Fallback to target real
+    
+    nb = max(len(source_loader), len(target_loader), len(source_fake_loader) if source_fake else 0, len(target_fake_loader) if target_fake else 0)
     
     # ========================================================================
     # LOSS FUNCTION
@@ -188,12 +228,14 @@ def train(opt):
         else:
             current_lambda = opt.lambda_weight
         
-        # Initialize loss tracking
-        mloss = torch.zeros(4, device=device)  # box, cls, dfl, distill
+        # Initialize loss tracking: box, cls, dfl, distill, domain (5 components)
+        mloss = torch.zeros(5, device=device)
         
-        # Create iterators
+        # Create iterators for all 4 dataloaders
         source_iter = iter(source_loader)
+        source_fake_iter = iter(source_fake_loader)
         target_iter = iter(target_loader)
+        target_fake_iter = iter(target_fake_loader)
         
         pbar = tqdm(range(nb), desc=f'Epoch {epoch}/{opt.epochs-1}')
         
@@ -201,22 +243,41 @@ def train(opt):
         
         for i in pbar:
             # ================================================================
-            # LOAD DATA
+            # LOAD DATA (4 inputs: SR, SF, TR, TF)
             # ================================================================
+            # Source Real
             try:
                 batch_source = next(source_iter)
             except StopIteration:
                 source_iter = iter(source_loader)
                 batch_source = next(source_iter)
             
+            # Source Fake
+            try:
+                batch_source_fake = next(source_fake_iter)
+            except StopIteration:
+                source_fake_iter = iter(source_fake_loader)
+                batch_source_fake = next(source_fake_iter)
+            
+            # Target Real
             try:
                 batch_target = next(target_iter)
             except StopIteration:
                 target_iter = iter(target_loader)
                 batch_target = next(target_iter)
             
+            # Target Fake
+            try:
+                batch_target_fake = next(target_fake_iter)
+            except StopIteration:
+                target_fake_iter = iter(target_fake_loader)
+                batch_target_fake = next(target_fake_iter)
+            
+            # Normalize all inputs
             imgs_source = batch_source['img'].to(device).float() / 255.0
+            imgs_source_fake = batch_source_fake['img'].to(device).float() / 255.0
             imgs_target = batch_target['img'].to(device).float() / 255.0
+            imgs_target_fake = batch_target_fake['img'].to(device).float() / 255.0
             
             # ================================================================
             # FORWARD PASS (4 PHASES)
@@ -224,7 +285,7 @@ def train(opt):
             with amp.autocast(enabled=device.type != 'cpu'):
                 
                 # ============================================================
-                # PHASE 1: SOURCE FORWARD
+                # PHASE 1: SOURCE REAL FORWARD
                 # ============================================================
                 pred_source = model_student(imgs_source)
                 loss_source, loss_items_source = compute_loss(pred_source, batch_source)
@@ -235,7 +296,17 @@ def train(opt):
                     source_features = feature_hook.get_features()
                 
                 # ============================================================
-                # PHASE 2: TARGET FORWARD
+                # PHASE 1B: SOURCE FAKE FORWARD (same labels as source real)
+                # ============================================================
+                pred_source_fake = model_student(imgs_source_fake)
+                loss_source_fake, _ = compute_loss(pred_source_fake, batch_source)  # Use source real labels!
+                
+                # Clear GRL hook buffer
+                if opt.use_grl and feature_hook:
+                    _ = feature_hook.get_features()
+                
+                # ============================================================
+                # PHASE 2: TARGET REAL FORWARD
                 # ============================================================
                 pred_target = model_student(imgs_target)
                 
@@ -261,8 +332,8 @@ def train(opt):
                 # PHASE 4: PSEUDO-LABELS & DISTILLATION
                 # ============================================================
                 with torch.no_grad():
-                    # Get teacher predictions on target domain
-                    pred_teacher = model_teacher(imgs_target)
+                    # Get teacher predictions on target FAKE domain
+                    pred_teacher = model_teacher(imgs_target_fake)
                     
                     # Extract predictions tensor
                     pred_tensor = pred_teacher[0] if isinstance(pred_teacher, (list, tuple)) else pred_teacher
@@ -289,9 +360,9 @@ def train(opt):
                 )
                 
                 # ============================================================
-                # TOTAL LOSS
+                # TOTAL LOSS (SR + SF + Distill + Domain)
                 # ============================================================
-                loss = loss_source + loss_distillation * current_lambda + loss_domain
+                loss = loss_source + loss_source_fake + loss_distillation * current_lambda + loss_domain
             
             # ================================================================
             # BACKWARD
@@ -305,9 +376,9 @@ def train(opt):
             scaler.update()
             optimizer.zero_grad()
             
-            # Update GRL optimizer
+            # Update GRL optimizer (with scaler for mixed precision)
             if opt.use_grl and epoch >= opt.grl_warmup and grl_optimizer:
-                grl_optimizer.step()
+                scaler.step(grl_optimizer)
                 grl_optimizer.zero_grad()
             
             # Update teacher with EMA
@@ -321,6 +392,7 @@ def train(opt):
                 loss_items_source[1].item() if isinstance(loss_items_source, (list, tuple)) and len(loss_items_source) > 1 else 0,
                 loss_items_source[2].item() if isinstance(loss_items_source, (list, tuple)) and len(loss_items_source) > 2 else 0,
                 loss_distillation.item(),
+                loss_domain.item(),
             ], device=device)
             
             mloss = (mloss * i + loss_items) / (i + 1)
@@ -328,8 +400,9 @@ def train(opt):
             mem = f'{torch.cuda.memory_reserved() / 1e9:.1f}G' if torch.cuda.is_available() else 'CPU'
             pbar.set_postfix({
                 'mem': mem,
-                'loss': f'{mloss[0]:.4f}',
+                'box': f'{mloss[0]:.4f}',
                 'distill': f'{mloss[3]:.4f}',
+                'domain': f'{mloss[4]:.4f}',
             })
         
         # ================================================================
