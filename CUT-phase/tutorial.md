@@ -361,7 +361,8 @@ python test.py \
     --CUT_mode CUT \
     --preprocess none \
     --phase train \
-    --gpu_ids 0
+    --gpu_ids 0 \
+    --direction BtoA
 ```
 
 **Output Location:** `./results/cityscapes_CUT_BtoA/train_latest/images/`

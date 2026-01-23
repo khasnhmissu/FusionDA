@@ -25,6 +25,8 @@ from utils.FDA_helpers import (
     filter_pseudo_labels_by_uncertainty,
     get_progressive_lambda,
 )
+from utils.training_logger import TrainingLogger
+from utils.domain_monitor import DomainMonitor
 
 def train(opt):
     """Main training function"""
@@ -207,12 +209,61 @@ def train(opt):
     scaler = amp.GradScaler(enabled=device.type != 'cpu')
     
     # ========================================================================
+    # LOGGER SETUP
+    # ========================================================================
+    logger = TrainingLogger(
+        save_dir=str(save_dir),
+        project_name='FusionDA',
+        use_tensorboard=True,
+        verbose=True,
+    )
+    logger.log_config({
+        'weights': opt.weights,
+        'data': opt.data,
+        'epochs': opt.epochs,
+        'batch_size': opt.batch,
+        'imgsz': opt.imgsz,
+        'lr0': opt.lr0,
+        'teacher_alpha': opt.teacher_alpha,
+        'conf_thres': opt.conf_thres,
+        'lambda_weight': opt.lambda_weight,
+        'use_grl': opt.use_grl,
+        'grl_weight': opt.grl_weight if opt.use_grl else 0,
+        'nc': nc,
+        'names': names,
+    })
+    
+    # ========================================================================
+    # DOMAIN MONITOR SETUP (Explainability)
+    # ========================================================================
+    domain_monitor = None
+    if opt.enable_monitoring:
+        # Determine UMAP epochs based on total
+        if opt.epochs <= 50:
+            umap_epochs = [0, opt.epochs // 2, opt.epochs - 1]
+            tsne_epochs = [0, opt.epochs - 1]
+        else:
+            step = opt.epochs // 4
+            umap_epochs = [0, step, step * 2, step * 3, opt.epochs - 1]
+            tsne_epochs = [0, opt.epochs // 2, opt.epochs - 1]
+        
+        domain_monitor = DomainMonitor(
+            save_dir=str(save_dir),
+            umap_epochs=umap_epochs,
+            tsne_epochs=tsne_epochs,
+            verbose=True,
+        )
+        domain_monitor.set_total_epochs(opt.epochs)
+        LOGGER.info(f'{colorstr("DomainMonitor:")} Enabled with UMAP at epochs {umap_epochs}')
+    
+    # ========================================================================
     # TRAINING LOOP
     # ========================================================================
     LOGGER.info(f'\n{colorstr("Starting training:")} {opt.epochs} epochs...\n')
     
     best_fitness = 0.0
     t0 = time.time()
+    global_step = 0
     
     for epoch in range(opt.epochs):
         model_student.train()
@@ -327,6 +378,12 @@ def train(opt):
                         domain_pred_target = domain_discriminator(target_features, current_grl_alpha)
                         loss_domain = compute_domain_loss(domain_pred_source, domain_pred_target) * opt.grl_weight
                         domain_acc = get_domain_accuracy(domain_pred_source, domain_pred_target)
+                        
+                        # Track domain accuracy for explainability
+                        if domain_monitor:
+                            domain_monitor.update_domain_accuracy(
+                                domain_pred_source, domain_pred_target, epoch, i
+                            )
                 
                 # ============================================================
                 # PHASE 4: PSEUDO-LABELS & DISTILLATION
@@ -408,6 +465,28 @@ def train(opt):
             
             mloss = (mloss * i + loss_items) / (i + 1)
             
+            # Log to TrainingLogger
+            logger.log_iteration(epoch, i, {
+                'loss_sr': loss_source.item(),
+                'loss_sf': loss_source_fake.item(),
+                'loss_distill': loss_distillation.item(),
+                'loss_domain': loss_domain.item(),
+                'loss_total': loss.item(),
+            }, extra={
+                'lr': optimizer.param_groups[0]['lr'],
+                'grl_alpha': current_grl_alpha if opt.use_grl else 0,
+                'conf_thres': adaptive_conf,
+                'lambda': current_lambda,
+            }, global_step=global_step)
+            global_step += 1
+            
+            # Collect features for explainability (every 10 iterations)
+            if domain_monitor and i % 10 == 0:
+                domain_monitor.collect_features(
+                    features_sr=source_features,
+                    features_tr=target_features,
+                )
+            
             mem = f'{torch.cuda.memory_reserved() / 1e9:.1f}G' if torch.cuda.is_available() else 'CPU'
             pbar.set_postfix({
                 'mem': mem,
@@ -421,6 +500,11 @@ def train(opt):
         # ================================================================
         scheduler.step()
         
+        # Domain monitoring end-of-epoch analysis
+        if domain_monitor:
+            monitor_result = domain_monitor.end_epoch(epoch)
+            LOGGER.info(f'[Monitor] {domain_monitor.mmd_tracker.get_interpretation()}')
+        
         # Validation every 10 epochs
         if (epoch + 1) % 10 == 0 or epoch == opt.epochs - 1:
             # Use Ultralytics validation
@@ -429,6 +513,14 @@ def train(opt):
             current_map = metrics.box.map
             
             LOGGER.info(f'Epoch {epoch}: mAP@50={current_map50:.4f}, mAP@50-95={current_map:.4f}')
+            
+            # Log epoch metrics
+            logger.log_epoch(epoch, {
+                'mAP50': current_map50,
+                'mAP50-95': current_map,
+                'precision': metrics.box.mp,
+                'recall': metrics.box.mr,
+            })
             
             # Save best
             if current_map50 > best_fitness:
@@ -454,10 +546,18 @@ def train(opt):
     if feature_hook:
         feature_hook.remove()
     
+    # Finalize logger
+    logger.finalize()
+    
+    # Finalize domain monitor
+    if domain_monitor:
+        domain_monitor.finalize()
+    
     hours = (time.time() - t0) / 3600
     LOGGER.info(f'\n{opt.epochs} epochs completed in {hours:.2f} hours.')
     LOGGER.info(f'Best mAP@50: {best_fitness:.4f}')
     LOGGER.info(f'Results saved to {save_dir}')
+    LOGGER.info(f'Run visualization: python utils/visualize_training.py --log-dir {save_dir}')
     
     return best_fitness
 # ============================================================================
@@ -501,6 +601,9 @@ def parse_args():
     # Output
     parser.add_argument('--project', type=str, default='runs/fda', help='Project dir')
     parser.add_argument('--name', type=str, default='exp', help='Experiment name')
+    
+    # Monitoring & Explainability
+    parser.add_argument('--enable-monitoring', action='store_true', help='Enable domain monitoring (UMAP, MMD, etc.)')
     
     return parser.parse_args()
 
