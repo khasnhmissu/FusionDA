@@ -1,0 +1,13 @@
+# Foggy Domain Dataset (Target Real)
+# ===================================
+
+path: datasets
+
+nc: 2
+names:
+  0: person
+  1: car
+
+train: target_real/target_real/images
+val: target_real/target_real/images
+test: target_real/target_real/images

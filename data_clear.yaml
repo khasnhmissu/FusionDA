@@ -1,0 +1,13 @@
+# Clear Domain Dataset (Source Real)
+# ===================================
+
+path: datasets
+
+nc: 2
+names:
+  0: person
+  1: car
+
+train: source_real/source_real/images
+val: source_real/source_real/images
+test: source_real/source_real/images

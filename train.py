@@ -507,30 +507,33 @@ def train(opt):
         
         # Validation every 10 epochs
         if (epoch + 1) % 10 == 0 or epoch == opt.epochs - 1:
-            # Use Ultralytics validation
-            metrics = yolo_student.val(data=opt.data, split='test', verbose=False)
-            current_map50 = metrics.box.map50
-            current_map = metrics.box.map
-            
-            LOGGER.info(f'Epoch {epoch}: mAP@50={current_map50:.4f}, mAP@50-95={current_map:.4f}')
-            
-            # Log epoch metrics
-            logger.log_epoch(epoch, {
-                'mAP50': current_map50,
-                'mAP50-95': current_map,
-                'precision': metrics.box.mp,
-                'recall': metrics.box.mr,
-            })
-            
-            # Save best
-            if current_map50 > best_fitness:
-                best_fitness = current_map50
-                torch.save({
-                    'epoch': epoch,
-                    'model': model_student.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'best_fitness': best_fitness,
-                }, save_dir / 'weights' / 'best.pt')
+            try:
+                # Use Ultralytics validation
+                metrics = yolo_student.val(data=opt.data, split='test', verbose=False)
+                current_map50 = metrics.box.map50
+                current_map = metrics.box.map
+                
+                LOGGER.info(f'Epoch {epoch}: mAP@50={current_map50:.4f}, mAP@50-95={current_map:.4f}')
+                
+                # Log epoch metrics
+                logger.log_epoch(epoch, {
+                    'mAP50': current_map50,
+                    'mAP50-95': current_map,
+                    'precision': metrics.box.mp,
+                    'recall': metrics.box.mr,
+                })
+                
+                # Save best
+                if current_map50 > best_fitness:
+                    best_fitness = current_map50
+                    torch.save({
+                        'epoch': epoch,
+                        'model': model_student.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'best_fitness': best_fitness,
+                    }, save_dir / 'weights' / 'best.pt')
+            except Exception as e:
+                LOGGER.warning(f'Validation failed (epoch {epoch}): {e}')
         
         # Save last
         torch.save({
