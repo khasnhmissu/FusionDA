@@ -1,0 +1,84 @@
+# FusionDA Training Tutorial
+
+## Quick Setup (GPU Server)
+
+```bash
+# 1. Upload and setup
+scp -r FusionDA user@server:~/
+ssh user@server
+cd ~/FusionDA
+chmod +x setup_server.sh
+./setup_server.sh
+```
+
+## Manual Setup
+
+### Download Datasets
+```bash
+pip install gdown
+mkdir -p datasets && cd datasets
+
+gdown 1p_pJjOIngZ6ylbPSs2fD3Eo7QR8q5C2b -O source_real.zip
+mkdir source_real && unzip -q source_real.zip -d source_real && rm source_real.zip
+
+gdown 1Mh2dm0lzBk8gi7R8zTj0e2V9tXus8Tmb -O source_fake.zip
+mkdir source_fake && unzip -q source_fake.zip -d source_fake && rm source_fake.zip
+
+gdown 1Y8GA79Hng9MD6llcSi3ys4NgWouxTnZb -O target_real.zip
+mkdir target_real && unzip -q target_real.zip -d target_real && rm target_real.zip
+
+gdown 15xPIUiQ7Io2W8xrPBQYcwPoFiwsNKddW -O target_fake.zip
+mkdir target_fake && unzip -q target_fake.zip -d target_fake && rm target_fake.zip
+
+cd ..
+```
+
+### Folder Structure After Unzip
+```
+datasets/
+├── source_real/
+│   └── source_real/     ← nested folder from zip
+│       ├── images/train/
+│       └── labels/train/
+├── source_fake/
+│   └── source_fake/
+│       ├── images/train/
+│       └── labels/train/
+├── target_real/
+│   └── target_real/
+│       ├── images/train/
+│       └── labels/train/
+└── target_fake/
+    └── target_fake/
+        ├── images/train/
+        └── labels/train/
+```
+
+### Train
+```bash
+# Basic
+python train.py --data data.yaml --weights yolov8n.pt --epochs 200 --batch 16
+
+# With GRL domain adaptation
+python train.py --data data.yaml --weights yolov8n.pt --epochs 200 --batch 16 --use-grl
+
+# With monitoring (UMAP, MMD)
+python train.py --data data.yaml --weights yolov8n.pt --epochs 200 --batch 16 --use-grl --enable-monitoring
+```
+
+## Key Arguments
+| Arg | Default | Description |
+|-----|---------|-------------|
+| --epochs | 200 | Training epochs |
+| --batch | 16 | Batch size |
+| --use-grl | off | Enable domain adaptation |
+| --enable-monitoring | off | Enable explainability |
+
+## Outputs
+```
+runs/fda/exp/
+├── weights/best.pt
+├── weights/last.pt
+├── epoch_metrics.csv
+└── explainability/  (if monitoring enabled)
+```

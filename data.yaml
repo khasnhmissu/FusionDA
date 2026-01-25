@@ -1,4 +1,22 @@
-train_source_real: path/to/source_real
-train_source_fake: path/to/source_fake  
-train_target_real: path/to/target_real
-train_target_fake: path/to/target_fake
+# FusionDA Dataset Configuration
+# ================================
+# ZIP structure: xxx.zip → xxx/images/, xxx/labels/
+# After unzip to datasets/: datasets/xxx/xxx/images/
+
+# Root path
+path: datasets
+
+# Classes
+nc: 1
+names:
+  0: forklift
+
+# Training data (nested folder structure from zip)
+train_source_real: source_real/source_real/images/train
+train_source_fake: source_fake/source_fake/images/train
+train_target_real: target_real/target_real/images/train
+train_target_fake: target_fake/target_fake/images/train
+
+# Validation (using target_real)
+val: target_real/target_real/images/train
+test: target_real/target_real/images/train
