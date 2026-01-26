@@ -86,9 +86,9 @@ def compute_mmd(source_features, target_features, kernel='gaussian'):
     if target_features.dim() > 2:
         target_features = target_features.view(target_features.size(0), -1)
     
-    # Move to CPU for computation
-    source_features = source_features.detach().cpu()
-    target_features = target_features.detach().cpu()
+    # Move to CPU and convert to float32 for computation (handles Half precision)
+    source_features = source_features.detach().cpu().float()
+    target_features = target_features.detach().cpu().float()
     
     n_s = source_features.size(0)
     n_t = target_features.size(0)

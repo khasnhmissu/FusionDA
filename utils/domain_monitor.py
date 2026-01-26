@@ -75,9 +75,9 @@ class DomainMonitor:
         self.explainability_dir = self.save_dir / 'explainability'
         self.explainability_dir.mkdir(parents=True, exist_ok=True)
         
-        # Default schedules
+        # Default schedules (t-SNE disabled by default - too memory-intensive)
         self.umap_epochs = set(umap_epochs or [0, 25, 50, 100, 150, 199])
-        self.tsne_epochs = set(tsne_epochs or [0, 100, 199])
+        self.tsne_epochs = set(tsne_epochs or [])  # Disabled - use UMAP only
         self.mmd_every_n_epochs = mmd_every_n_epochs
         self.verbose = verbose
         
@@ -419,11 +419,11 @@ def create_monitor_from_args(opt, save_dir: str) -> DomainMonitor:
     
     if total_epochs <= 50:
         umap_epochs = [0, total_epochs // 2, total_epochs - 1]
-        tsne_epochs = [0, total_epochs - 1]
+        tsne_epochs = []  # Disabled - causes OOM
     else:
         step = total_epochs // 4
         umap_epochs = [0, step, step * 2, step * 3, total_epochs - 1]
-        tsne_epochs = [0, total_epochs // 2, total_epochs - 1]
+        tsne_epochs = []  # Disabled - causes OOM
     
     monitor = DomainMonitor(
         save_dir=save_dir,

@@ -1,6 +1,7 @@
 import torch
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.ops import xyxy2xywhn
+from ultralytics.cfg import get_cfg
 
 class WeightEMA:
     """
@@ -106,12 +107,75 @@ class FDALoss:
     Uses Ultralytics v8DetectionLoss internally.
     """
     def __init__(self, model):
+        from ultralytics.utils import IterableSimpleNamespace
+        
+        # Create complete hyp config with ALL required attributes
+        # Including loss weights that get_cfg() doesn't provide
+        hyp = IterableSimpleNamespace(
+            # Loss weights (CRITICAL - these are required by v8DetectionLoss)
+            box=7.5,      # box loss gain
+            cls=0.5,      # cls loss gain
+            dfl=1.5,      # dfl loss gain
+            pose=12.0,    # pose loss gain
+            kobj=1.0,     # keypoint obj loss gain
+            # Other training hyperparameters
+            lr0=0.01,
+            lrf=0.01,
+            momentum=0.937,
+            weight_decay=0.0005,
+            warmup_epochs=3.0,
+            warmup_momentum=0.8,
+            warmup_bias_lr=0.1,
+            # Augmentation (needed for some operations)
+            hsv_h=0.015,
+            hsv_s=0.7,
+            hsv_v=0.4,
+            degrees=0.0,
+            translate=0.1,
+            scale=0.5,
+            shear=0.0,
+            perspective=0.0,
+            flipud=0.0,
+            fliplr=0.5,
+            mosaic=1.0,
+            mixup=0.0,
+            copy_paste=0.0,
+            # Other
+            label_smoothing=0.0,
+            nbs=64,
+            overlap_mask=True,
+            mask_ratio=4,
+            dropout=0.0,
+        )
+        
+        # Set model.args
+        model.args = hyp
+        
         self.detection_loss = v8DetectionLoss(model)
+        
+        # Ensure hyp is IterableSimpleNamespace 
+        self.detection_loss.hyp = hyp
+        
         self.device = next(model.parameters()).device
     
     def __call__(self, preds, batch):
         """Compute detection loss using Ultralytics internals"""
-        return self.detection_loss(preds, batch)
+        result = self.detection_loss(preds, batch)
+        
+        # v8DetectionLoss returns (loss_sum, loss_items_tensor)
+        # loss_sum should be scalar, but ensure it
+        if isinstance(result, tuple):
+            loss = result[0]
+            loss_items = result[1] if len(result) > 1 else None
+        else:
+            loss = result
+            loss_items = None
+        
+        # Ensure scalar
+        if loss.numel() > 1:
+            loss = loss.sum()
+            
+        return loss, loss_items
     
     def compute_distillation_loss(self, student_preds, pseudo_targets, img_shape):
         """

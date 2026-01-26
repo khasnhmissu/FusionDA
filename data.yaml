@@ -17,6 +17,7 @@ train_source_fake: source_fake/source_fake/images
 train_target_real: target_real/target_real/images
 train_target_fake: target_fake/target_fake/images
 
-# Validation (optional - dùng target_real để đánh giá trên domain đích)
+# Required by YOLO for validation
+train: source_real/source_real/images
 val: target_real/target_real/images
 test: target_real/target_real/images

@@ -297,11 +297,11 @@ class FeatureVisualizer:
             print("[t-SNE] Missing dependencies")
             return None
         
-        # Combine features
+        # Combine features (smaller sample for t-SNE to prevent OOM)
         combined, domains, classes = self._combine_features(
             features_sr, features_sf, features_tr, features_tf,
             labels_sr, labels_tr,
-            max_per_domain=300,  # Smaller for t-SNE (slower)
+            max_per_domain=150,  # Smaller for t-SNE (very memory-intensive)
         )
         
         if combined is None:
@@ -310,13 +310,21 @@ class FeatureVisualizer:
         
         print(f"[t-SNE] Projecting {len(combined)} samples...")
         
-        # t-SNE projection
-        tsne = TSNE(
-            n_components=2,
-            perplexity=min(perplexity, len(combined) - 1),
-            n_iter=1000,
-            random_state=42,
-        )
+        # t-SNE projection (max_iter for sklearn >= 1.2, n_iter for older)
+        try:
+            tsne = TSNE(
+                n_components=2,
+                perplexity=min(perplexity, len(combined) - 1),
+                max_iter=1000,  # sklearn >= 1.2
+                random_state=42,
+            )
+        except TypeError:
+            tsne = TSNE(
+                n_components=2,
+                perplexity=min(perplexity, len(combined) - 1),
+                n_iter=1000,  # sklearn < 1.2
+                random_state=42,
+            )
         
         try:
             embedding = tsne.fit_transform(combined)

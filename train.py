@@ -11,8 +11,8 @@ import torch.optim.lr_scheduler as lr_scheduler
 from torch.cuda import amp
 
 from ultralytics import YOLO
-from ultralytics.utils.ops import non_max_suppression
 from ultralytics.utils import LOGGER, colorstr
+from ultralytics.utils.nms import non_max_suppression
 
 from domain_adaptation import (
     DomainDiscriminator, YOLOv8FeatureHook,
@@ -52,6 +52,10 @@ def train(opt):
     # Load student model
     yolo_student = YOLO(opt.weights)
     model_student = yolo_student.model.to(device)
+    
+    # CRITICAL: Unfreeze student model parameters (YOLO loads frozen by default)
+    for param in model_student.parameters():
+        param.requires_grad = True
     
     # Create teacher model (deep copy)
     model_teacher = deepcopy(model_student).to(device)
@@ -143,62 +147,70 @@ def train(opt):
     LOGGER.info(f'Target Fake: {target_fake}')
     
     # Build dataloaders using Ultralytics
-    from ultralytics.data import build_dataloader, build_yolo_dataset
+    from ultralytics.data import YOLODataset
+    from torch.utils.data import DataLoader
+    from ultralytics.cfg import get_cfg
     
     gs = max(int(model_student.stride.max()), 32)
     
-    # Source dataloader
-    source_dataset = build_yolo_dataset(
-        yolo_student.overrides,
+    # Get default hyperparameters from ultralytics
+    default_cfg = get_cfg()
+    
+    # Common dataset config
+    dataset_args = {
+        'imgsz': opt.imgsz,
+        'batch_size': opt.batch,
+        'augment': True,
+        'hyp': default_cfg,  # Use ultralytics full default config
+        'rect': False,
+        'cache': False,
+        'single_cls': False,
+        'stride': gs,
+        'pad': 0.5,
+        'classes': None,
+        'data': data_dict,
+        'task': 'detect',
+    }
+    
+    # Source Real dataloader
+    source_dataset = YOLODataset(
         img_path=source_real[0] if source_real else '',
-        batch=opt.batch,
-        data=data_dict,
-        mode='train',
-        stride=gs,
+        **dataset_args
     )
-    source_loader = build_dataloader(source_dataset, opt.batch, opt.workers, shuffle=True)
+    source_loader = DataLoader(
+        source_dataset, batch_size=opt.batch, shuffle=True,
+        num_workers=opt.workers, pin_memory=True, collate_fn=YOLODataset.collate_fn
+    )
     
     # Target Real dataloader
     if target_real:
-        target_dataset = build_yolo_dataset(
-            yolo_student.overrides,
-            img_path=target_real[0],
-            batch=opt.batch,
-            data=data_dict,
-            mode='train',
-            stride=gs,
+        target_dataset = YOLODataset(img_path=target_real[0], **dataset_args)
+        target_loader = DataLoader(
+            target_dataset, batch_size=opt.batch, shuffle=True,
+            num_workers=opt.workers, pin_memory=True, collate_fn=YOLODataset.collate_fn
         )
-        target_loader = build_dataloader(target_dataset, opt.batch, opt.workers, shuffle=True)
     else:
-        target_loader = source_loader  # Fallback
+        target_loader = source_loader
     
     # Source Fake dataloader
     if source_fake:
-        source_fake_dataset = build_yolo_dataset(
-            yolo_student.overrides,
-            img_path=source_fake[0],
-            batch=opt.batch,
-            data=data_dict,
-            mode='train',
-            stride=gs,
+        source_fake_dataset = YOLODataset(img_path=source_fake[0], **dataset_args)
+        source_fake_loader = DataLoader(
+            source_fake_dataset, batch_size=opt.batch, shuffle=True,
+            num_workers=opt.workers, pin_memory=True, collate_fn=YOLODataset.collate_fn
         )
-        source_fake_loader = build_dataloader(source_fake_dataset, opt.batch, opt.workers, shuffle=True)
     else:
-        source_fake_loader = source_loader  # Fallback to source real
+        source_fake_loader = source_loader
     
     # Target Fake dataloader
     if target_fake:
-        target_fake_dataset = build_yolo_dataset(
-            yolo_student.overrides,
-            img_path=target_fake[0],
-            batch=opt.batch,
-            data=data_dict,
-            mode='train',
-            stride=gs,
+        target_fake_dataset = YOLODataset(img_path=target_fake[0], **dataset_args)
+        target_fake_loader = DataLoader(
+            target_fake_dataset, batch_size=opt.batch, shuffle=True,
+            num_workers=opt.workers, pin_memory=True, collate_fn=YOLODataset.collate_fn
         )
-        target_fake_loader = build_dataloader(target_fake_dataset, opt.batch, opt.workers, shuffle=True)
     else:
-        target_fake_loader = target_loader  # Fallback to target real
+        target_fake_loader = target_loader
     
     nb = max(len(source_loader), len(target_loader), len(source_fake_loader) if source_fake else 0, len(target_fake_loader) if target_fake else 0)
     
@@ -241,11 +253,11 @@ def train(opt):
         # Determine UMAP epochs based on total
         if opt.epochs <= 50:
             umap_epochs = [0, opt.epochs // 2, opt.epochs - 1]
-            tsne_epochs = [0, opt.epochs - 1]
+            tsne_epochs = []  # Disabled - causes OOM
         else:
             step = opt.epochs // 4
             umap_epochs = [0, step, step * 2, step * 3, opt.epochs - 1]
-            tsne_epochs = [0, opt.epochs // 2, opt.epochs - 1]
+            tsne_epochs = []  # Disabled - causes OOM
         
         domain_monitor = DomainMonitor(
             save_dir=str(save_dir),
@@ -341,9 +353,9 @@ def train(opt):
                 pred_source = model_student(imgs_source)
                 loss_source, loss_items_source = compute_loss(pred_source, batch_source)
                 
-                # Extract source features for GRL
+                # Extract source features (ALWAYS for monitoring, used for GRL after warmup)
                 source_features = None
-                if opt.use_grl and epoch >= opt.grl_warmup and feature_hook:
+                if feature_hook:
                     source_features = feature_hook.get_features()
                 
                 # ============================================================
@@ -361,9 +373,9 @@ def train(opt):
                 # ============================================================
                 pred_target = model_student(imgs_target)
                 
-                # Extract target features for GRL
+                # Extract target features (ALWAYS for monitoring, used for GRL after warmup)
                 target_features = None
-                if opt.use_grl and epoch >= opt.grl_warmup and feature_hook:
+                if feature_hook:
                     target_features = feature_hook.get_features()
                 
                 # ============================================================
@@ -419,6 +431,17 @@ def train(opt):
                 # ============================================================
                 # TOTAL LOSS (SR + SF + Distill + Domain)
                 # ============================================================
+                # Ensure all losses are scalars
+                def ensure_scalar(x):
+                    if isinstance(x, torch.Tensor) and x.numel() > 1:
+                        return x.sum()
+                    return x
+                
+                loss_source = ensure_scalar(loss_source)
+                loss_source_fake = ensure_scalar(loss_source_fake)
+                loss_distillation = ensure_scalar(loss_distillation)
+                loss_domain = ensure_scalar(loss_domain)
+                
                 loss = loss_source + loss_source_fake + loss_distillation * current_lambda + loss_domain
             
             # ================================================================
@@ -426,23 +449,20 @@ def train(opt):
             # ================================================================
             scaler.scale(loss).backward()
             
-            # Gradient clipping for stability
+            # ================================================================
+            # OPTIMIZER STEP (with proper scaler handling)
+            # ================================================================
+            # Gradient clipping and step
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model_student.parameters(), max_norm=10.0)
             
-            # ================================================================
-            # OPTIMIZER STEP (correct order: all step() before update())
-            # ================================================================
+            # Step optimizer (scaler handles inf/nan checking internally)
             scaler.step(optimizer)
-            
-            # Update GRL optimizer (with scaler for mixed precision)
-            if opt.use_grl and epoch >= opt.grl_warmup and grl_optimizer:
-                scaler.unscale_(grl_optimizer)
-                torch.nn.utils.clip_grad_norm_(domain_discriminator.parameters(), max_norm=10.0)
-                scaler.step(grl_optimizer)
-            
-            # Update scaler AFTER all step() calls
             scaler.update()
+            
+            # Update GRL optimizer (without scaler to avoid conflicts)
+            if opt.use_grl and epoch >= opt.grl_warmup and grl_optimizer and loss_domain.item() > 0:
+                grl_optimizer.step()
             
             # Zero gradients
             optimizer.zero_grad()
@@ -581,12 +601,12 @@ def parse_args():
     parser.add_argument('--workers', type=int, default=8, help='Dataloader workers')
     
     # Optimizer
-    parser.add_argument('--lr0', type=float, default=0.01, help='Initial learning rate')
+    parser.add_argument('--lr0', type=float, default=0.001, help='Initial learning rate')
     parser.add_argument('--lrf', type=float, default=0.01, help='Final learning rate factor')
     
     # Teacher-Student
     parser.add_argument('--teacher-alpha', type=float, default=0.999, help='Teacher EMA decay')
-    parser.add_argument('--conf-thres', type=float, default=0.5, help='Pseudo-label confidence')
+    parser.add_argument('--conf-thres', type=float, default=0.25, help='Pseudo-label confidence')
     parser.add_argument('--iou-thres', type=float, default=0.3, help='NMS IoU threshold')
     parser.add_argument('--lambda-weight', type=float, default=0.005, help='Distillation weight')
     
@@ -596,7 +616,7 @@ def parse_args():
     
     # GRL
     parser.add_argument('--use-grl', action='store_true', help='Enable GRL')
-    parser.add_argument('--grl-warmup', type=int, default=20, help='GRL warmup epochs')
+    parser.add_argument('--grl-warmup', type=int, default=5, help='GRL warmup epochs')
     parser.add_argument('--grl-max-alpha', type=float, default=1.0, help='Max GRL alpha')
     parser.add_argument('--grl-weight', type=float, default=0.1, help='GRL loss weight')
     parser.add_argument('--grl-hidden-dim', type=int, default=256, help='Discriminator hidden dim')
