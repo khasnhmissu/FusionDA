@@ -1,7 +1,8 @@
 # FusionDA Dataset Configuration
 # ================================
 # ZIP structure: xxx.zip → xxx/images/, xxx/labels/
-# After: datasets/xxx/xxx/images/, datasets/xxx/xxx/labels/
+# After: datasets/xxx/xxx/train/images/, datasets/xxx/xxx/train/labels/
+#        datasets/xxx/xxx/val/images/, datasets/xxx/xxx/val/labels/
 
 path: datasets
 
@@ -11,13 +12,19 @@ names:
   0: person
   1: car
 
-# Training data paths
-train_source_real: source_real/source_real/images
-train_source_fake: source_fake/source_fake/images
-train_target_real: target_real/target_real/images
-train_target_fake: target_fake/target_fake/images
+# Training data paths (train split)
+train_source_real: source_real/source_real/train/images
+train_source_fake: source_fake/source_fake/train/images
+train_target_real: target_real/target_real/train/images
+train_target_fake: target_fake/target_fake/train/images
 
-# Required by YOLO for validation
-train: source_real/source_real/images
-val: target_real/target_real/images
-test: target_real/target_real/images
+# Validation data paths (val split)
+val_source_real: source_real/source_real/val/images
+val_source_fake: source_fake/source_fake/val/images
+val_target_real: target_real/target_real/val/images
+val_target_fake: target_fake/target_fake/val/images
+
+# Required by YOLO for training/validation
+train: source_real/source_real/train/images
+val: target_real/target_real/val/images
+test: target_real/target_real/val/images

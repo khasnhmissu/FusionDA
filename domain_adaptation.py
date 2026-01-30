@@ -77,6 +77,10 @@ class DomainDiscriminator(nn.Module):
         Returns:
             domain_pred: [B, 1] logits (source=1, target=0)
         """
+        # Safety check for NaN/Inf inputs - prevents gradient explosion
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            return torch.zeros(x.size(0), 1, device=x.device, requires_grad=True)
+        
         if alpha is not None:
             self.grl.alpha = alpha
         
@@ -172,13 +176,16 @@ class YOLOv8FeatureHook:
             self._hook_handle = None
     
     def __del__(self):
-        self.remove()
+        try:
+            self.remove()
+        except AttributeError:
+            pass  # Object was not fully initialized
 
 
 def get_grl_alpha(epoch, total_epochs, warmup_epochs=10, max_alpha=1.0):
     """
     Tính alpha cho GRL theo epoch (progressive training).
-    Matches original implementation.
+    Sử dụng quadratic schedule để tránh gradient explosion.
     
     Args:
         epoch: Current epoch
@@ -196,13 +203,14 @@ def get_grl_alpha(epoch, total_epochs, warmup_epochs=10, max_alpha=1.0):
     progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
     progress = min(progress, 1.0)
     
-    # Sigmoid-like curve for smooth transition
-    alpha = max_alpha * (2.0 / (1.0 + math.exp(-10.0 * progress)) - 1.0)
+    # Quadratic schedule - smoother and more stable than sigmoid
+    # Prevents sudden alpha jumps that cause gradient explosion
+    alpha = max_alpha * (progress ** 2)
     
     return alpha
 def compute_domain_loss(domain_pred_source, domain_pred_target):
     """
-    Tính Domain Adversarial Loss.
+    Tính Domain Adversarial Loss với safety checks.
     
     Args:
         domain_pred_source: Predictions cho source domain [B, 1]
@@ -211,6 +219,15 @@ def compute_domain_loss(domain_pred_source, domain_pred_target):
     Returns:
         domain_loss: Binary cross entropy loss (scalar)
     """
+    # Safety check for NaN/Inf
+    if (torch.isnan(domain_pred_source).any() or torch.isnan(domain_pred_target).any() or
+        torch.isinf(domain_pred_source).any() or torch.isinf(domain_pred_target).any()):
+        return torch.tensor(0.0, device=domain_pred_source.device, requires_grad=True)
+    
+    # Clamp predictions to prevent extreme gradients
+    domain_pred_source = torch.clamp(domain_pred_source, -10, 10)
+    domain_pred_target = torch.clamp(domain_pred_target, -10, 10)
+    
     batch_size_source = domain_pred_source.size(0)
     batch_size_target = domain_pred_target.size(0)
     

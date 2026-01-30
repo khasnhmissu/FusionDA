@@ -1,4 +1,5 @@
 import argparse
+import gc
 import math
 import time
 import yaml
@@ -12,6 +13,7 @@ from torch.cuda import amp
 
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER, colorstr
+from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.nms import non_max_suppression
 
 from domain_adaptation import (
@@ -113,7 +115,10 @@ def train(opt):
     # ========================================================================
     root = Path(data_dict.get('path', ''))
     
-    # Source domain paths (real + fake)
+    # ========================================================================
+    # TRAINING PATHS (use train split)
+    # ========================================================================
+    # Source domain paths (real + fake) - TRAIN split
     source_real = data_dict.get('train_source_real', data_dict.get('train', []))
     if isinstance(source_real, str):
         source_real = [source_real]
@@ -124,7 +129,7 @@ def train(opt):
         source_fake = [source_fake]
     source_fake = [str(root / p) for p in source_fake] if source_fake else []
     
-    # Target domain paths (real + fake)
+    # Target domain paths (real + fake) - TRAIN split
     target_real = data_dict.get('train_target_real', [])
     if isinstance(target_real, str):
         target_real = [target_real]
@@ -135,16 +140,25 @@ def train(opt):
         target_fake = [target_fake]
     target_fake = [str(root / p) for p in target_fake] if target_fake else []
     
-    # Test path
-    test_real = data_dict.get('test_target_real', data_dict.get('test', []))
-    if isinstance(test_real, str):
-        test_real = [test_real]
-    test_real = [str(root / p) for p in test_real]
+    # ========================================================================
+    # VALIDATION PATHS (use val split, fallback to train if not specified)
+    # ========================================================================
+    val_source_real = data_dict.get('val_source_real', data_dict.get('val', []))
+    if isinstance(val_source_real, str):
+        val_source_real = [val_source_real]
+    val_source_real = [str(root / p) for p in val_source_real] if val_source_real else source_real
     
-    LOGGER.info(f'Source Real: {source_real}')
-    LOGGER.info(f'Source Fake: {source_fake}')
-    LOGGER.info(f'Target Real: {target_real}')
-    LOGGER.info(f'Target Fake: {target_fake}')
+    val_target_real = data_dict.get('val_target_real', data_dict.get('test', []))
+    if isinstance(val_target_real, str):
+        val_target_real = [val_target_real]
+    val_target_real = [str(root / p) for p in val_target_real] if val_target_real else target_real
+    
+    LOGGER.info(f'Source Real (train): {source_real}')
+    LOGGER.info(f'Source Fake (train): {source_fake}')
+    LOGGER.info(f'Target Real (train): {target_real}')
+    LOGGER.info(f'Target Fake (train): {target_fake}')
+    LOGGER.info(f'Validation Source: {val_source_real}')
+    LOGGER.info(f'Validation Target: {val_target_real}')
     
     # Build dataloaders using Ultralytics
     from ultralytics.data import YOLODataset
@@ -183,33 +197,36 @@ def train(opt):
     )
     
     # Target Real dataloader
-    if target_real:
+    if target_real and target_real[0]:  # Check if path exists and is not empty
         target_dataset = YOLODataset(img_path=target_real[0], **dataset_args)
         target_loader = DataLoader(
             target_dataset, batch_size=opt.batch, shuffle=True,
             num_workers=opt.workers, pin_memory=True, collate_fn=YOLODataset.collate_fn
         )
     else:
+        LOGGER.warning(colorstr('yellow', 'WARNING: ') + 'train_target_real not found, using source_real as target!')
         target_loader = source_loader
     
     # Source Fake dataloader
-    if source_fake:
+    if source_fake and source_fake[0]:
         source_fake_dataset = YOLODataset(img_path=source_fake[0], **dataset_args)
         source_fake_loader = DataLoader(
             source_fake_dataset, batch_size=opt.batch, shuffle=True,
             num_workers=opt.workers, pin_memory=True, collate_fn=YOLODataset.collate_fn
         )
     else:
+        LOGGER.warning(colorstr('yellow', 'WARNING: ') + 'train_source_fake not found, using source_real!')
         source_fake_loader = source_loader
     
     # Target Fake dataloader
-    if target_fake:
+    if target_fake and target_fake[0]:
         target_fake_dataset = YOLODataset(img_path=target_fake[0], **dataset_args)
         target_fake_loader = DataLoader(
             target_fake_dataset, batch_size=opt.batch, shuffle=True,
             num_workers=opt.workers, pin_memory=True, collate_fn=YOLODataset.collate_fn
         )
     else:
+        LOGGER.warning(colorstr('yellow', 'WARNING: ') + 'train_target_fake not found, using target_real! Distillation will NOT work correctly!')
         target_fake_loader = target_loader
     
     nb = max(len(source_loader), len(target_loader), len(source_fake_loader) if source_fake else 0, len(target_fake_loader) if target_fake else 0)
@@ -217,9 +234,14 @@ def train(opt):
     # ========================================================================
     # LOSS FUNCTION
     # ========================================================================
-    compute_loss = FDALoss(model_student)
+    # Class mapping: COCO class ID -> Dataset class ID
+    # IMPORTANT: Include both COCO IDs (early training) AND dataset IDs (after EMA adaptation)
+    class_mapping = getattr(opt, 'class_mapping', {0: 0, 1: 1, 2: 1})
+    compute_loss = FDALoss(model_student, class_mapping=class_mapping)
     scaler = amp.GradScaler(enabled=device.type != 'cpu')
-    
+    # Đảm bảo scaler được enabled khi dùng CUDA
+    if device.type == 'cpu':
+        print("[WARNING] AMP disabled on CPU")
     # ========================================================================
     # LOGGER SETUP
     # ========================================================================
@@ -345,7 +367,7 @@ def train(opt):
             # ================================================================
             # FORWARD PASS (4 PHASES)
             # ================================================================
-            with amp.autocast(enabled=device.type != 'cpu'):
+            with torch.amp.autocast('cuda', enabled=device.type != 'cpu'):
                 
                 # ============================================================
                 # PHASE 1: SOURCE REAL FORWARD
@@ -381,7 +403,7 @@ def train(opt):
                 # ============================================================
                 # PHASE 3: DOMAIN LOSS (GRL)
                 # ============================================================
-                loss_domain = torch.tensor(0.0, device=device)
+                loss_domain = torch.tensor(0.0, device=device, requires_grad=False)
                 domain_acc = 0.0
                 
                 if opt.use_grl and epoch >= opt.grl_warmup:
@@ -400,36 +422,69 @@ def train(opt):
                 # ============================================================
                 # PHASE 4: PSEUDO-LABELS & DISTILLATION
                 # ============================================================
+                # Teacher generates pseudo-labels from target-fake
+                # Student predictions on target-real will be compared against these
+                
                 with torch.no_grad():
                     # Get teacher predictions on target FAKE domain
                     pred_teacher = model_teacher(imgs_target_fake)
                     
-                    # Extract predictions tensor
+                    # Extract predictions tensor - format [B, 4+nc, N]
+                    # YOLOv8 outputs: xywh (decoded) + class_scores (sigmoid applied)
+                    # NMS handles: transpose, xywh2xyxy, filtering internally
                     pred_tensor = pred_teacher[0] if isinstance(pred_teacher, (list, tuple)) else pred_teacher
                     
-                    # Adaptive confidence threshold
+                    # Adaptive confidence threshold (curriculum: starts low, increases)
                     adaptive_conf = get_adaptive_conf_thres(epoch, opt.epochs, opt.conf_thres)
                     
                     # NMS to get pseudo-labels
+                    # Output format: list of [N, 6] tensors with [x1,y1,x2,y2,conf,cls]
                     pseudo_labels = non_max_suppression(
                         pred_tensor,
                         conf_thres=adaptive_conf,
                         iou_thres=opt.iou_thres,
                         max_det=300,
-                        multi_label=True,
                     )
                     
-                    # Filter by uncertainty
-                    pseudo_labels = filter_pseudo_labels_by_uncertainty(pseudo_labels, 0.25)
+                    # Clip bboxes to valid range [0, imgsz] and filter invalid
+                    # Use target-real dimensions (same size as target-fake)
+                    img_h, img_w = imgs_target.shape[2:]
+                    for idx, preds in enumerate(pseudo_labels):
+                        if preds is not None and len(preds) > 0:
+                            # Clip coordinates
+                            preds[:, 0].clamp_(0, img_w)  # x1
+                            preds[:, 1].clamp_(0, img_h)  # y1
+                            preds[:, 2].clamp_(0, img_w)  # x2
+                            preds[:, 3].clamp_(0, img_h)  # y2
+                            # Filter valid boxes (x2 > x1, y2 > y1, min size)
+                            valid = (preds[:, 2] > preds[:, 0] + 2) & (preds[:, 3] > preds[:, 1] + 2)
+                            pseudo_labels[idx] = preds[valid]
+                    
+                    # Count pseudo-labels
+                    n_pseudo = sum(len(p) if p is not None else 0 for p in pseudo_labels)
+                    
+                    # Debug log (every 100 iterations)
+                    if i % 100 == 0:
+                        # Count predictions before class filtering (in fusion_da)
+                        n_raw = sum(len(p) if p is not None else 0 for p in pseudo_labels)
+                        if n_raw > 0:
+                            all_preds = torch.cat([p for p in pseudo_labels if p is not None and len(p) > 0])
+                            unique_cls = all_preds[:, 5].unique().tolist() if len(all_preds) > 0 else []
+                            LOGGER.info(f'[Pseudo-Labels] conf={adaptive_conf:.3f}, count={n_pseudo}, classes={unique_cls}')
+                        else:
+                            # Debug: check raw teacher output
+                            max_conf = pred_tensor[0, 4:].max().item() if len(pred_tensor.shape) == 3 else 0
+                            LOGGER.info(f'[Pseudo-Labels] conf={adaptive_conf:.3f}, count=0, teacher_max_conf={max_conf:.4f}')
                 
-                # Compute distillation loss
-                img_h, img_w = imgs_target.shape[2:]
+                # Compute distillation loss: Student(target-real) vs Teacher(target-fake) pseudo-labels
+                # This transfers knowledge from style-transferred domain back to real domain
                 loss_distillation = compute_loss.compute_distillation_loss(
-                    pred_target, pseudo_labels, (img_h, img_w)
+                    pred_target, pseudo_labels, (img_h, img_w)  # pred_target = Student on target-real
                 )
                 
                 # ============================================================
-                # TOTAL LOSS (SR + SF + Distill + Domain)
+                # TOTAL LOSS (Công thức 4.7)
+                # L = Ldet(Is) + Ldet(Isf) + α·Ldis + β·Lcon + Ldomain
                 # ============================================================
                 # Ensure all losses are scalars
                 def ensure_scalar(x):
@@ -442,35 +497,92 @@ def train(opt):
                 loss_distillation = ensure_scalar(loss_distillation)
                 loss_domain = ensure_scalar(loss_domain)
                 
-                loss = loss_source + loss_source_fake + loss_distillation * current_lambda + loss_domain
+                # ============================================================
+                # CONSISTENCY LOSS (Công thức 4.5)
+                # Lcon = ‖Ldet(Isource) - Ldet(Isource-fake)‖₂
+                # Ensures model predictions are consistent between real and fake
+                # 
+                # NOTE: We detach loss_source_fake to avoid conflicting gradients.
+                # This way, consistency loss only affects source_fake predictions
+                # to become more like source_real predictions.
+                # ============================================================
+                loss_consistency = (loss_source.detach() - loss_source_fake) ** 2  # L2 distance
+                consistency_weight = 2.0  # β = 2.0
+                
+                # Total Loss (Công thức 4.7):
+                # L = Ldet(Is) + Ldet(Isf) + α·Ldis + β·Lcon + Ldomain(GRL)
+                loss = (loss_source + loss_source_fake 
+                        + loss_distillation * current_lambda 
+                        + loss_consistency * consistency_weight
+                        + loss_domain)
+                
+                # NaN detection - skip batch if loss is invalid
+                if torch.isnan(loss) or torch.isinf(loss):
+                    LOGGER.warning(f'[NaN] Loss is NaN/Inf at epoch {epoch}, iter {i}. Skipping batch.')
+                    optimizer.zero_grad()
+                    if grl_optimizer:
+                        grl_optimizer.zero_grad()
+                    continue
             
             # ================================================================
             # BACKWARD
             # ================================================================
             scaler.scale(loss).backward()
-            
+
             # ================================================================
             # OPTIMIZER STEP (with proper scaler handling)
             # ================================================================
-            # Gradient clipping and step
+            # Always unscale the main optimizer first
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model_student.parameters(), max_norm=10.0)
             
-            # Step optimizer (scaler handles inf/nan checking internally)
+            # Handle GRL optimizer separately if it exists and is active
+            grl_optimizer_active = opt.use_grl and epoch >= opt.grl_warmup and grl_optimizer is not None
+            if grl_optimizer_active:
+                scaler.unscale_(grl_optimizer)
+
+            # Gradient clipping (after unscale, before step)
+            torch.nn.utils.clip_grad_norm_(model_student.parameters(), max_norm=5.0)  # Reduced from 10
+            if opt.use_grl and domain_discriminator:
+                torch.nn.utils.clip_grad_norm_(domain_discriminator.parameters(), max_norm=5.0)
+            
+            # Check for NaN in gradients - skip step if found
+            grad_nan = False
+            for p in model_student.parameters():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    grad_nan = True
+                    break
+            
+            if grad_nan:
+                LOGGER.warning(f'[NaN Grad] Gradients contain NaN/Inf at epoch {epoch}, iter {i}. Skipping step.')
+                optimizer.zero_grad()
+                if grl_optimizer:
+                    grl_optimizer.zero_grad()
+                # Must update scaler to reset state after unscale_()
+                scaler.update()
+                continue
+
+            # Step main optimizer
             scaler.step(optimizer)
+            
+            # Step GRL optimizer if active
+            if grl_optimizer_active:
+                scaler.step(grl_optimizer)
+
+            # Update scaler ONCE after all steps
             scaler.update()
-            
-            # Update GRL optimizer (without scaler to avoid conflicts)
-            if opt.use_grl and epoch >= opt.grl_warmup and grl_optimizer and loss_domain.item() > 0:
-                grl_optimizer.step()
-            
+
             # Zero gradients
             optimizer.zero_grad()
-            if opt.use_grl and grl_optimizer:
+            if grl_optimizer_active:
                 grl_optimizer.zero_grad()
             
-            # Update teacher with EMA
+            # Update teacher with EMA every iteration
+            # NaN protection is handled inside teacher_ema.step()
             teacher_ema.step()
+            
+            # Clear CUDA cache more frequently to prevent OOM
+            if i % 100 == 0:
+                torch.cuda.empty_cache()
             
             # ================================================================
             # LOGGING
@@ -490,6 +602,7 @@ def train(opt):
                 'loss_sr': loss_source.item(),
                 'loss_sf': loss_source_fake.item(),
                 'loss_distill': loss_distillation.item(),
+                'loss_consistency': loss_consistency.item(),
                 'loss_domain': loss_domain.item(),
                 'loss_total': loss.item(),
             }, extra={
@@ -500,8 +613,9 @@ def train(opt):
             }, global_step=global_step)
             global_step += 1
             
-            # Collect features for explainability (every 10 iterations)
-            if domain_monitor and i % 10 == 0:
+            # Collect features for explainability (every 50 iterations to save memory)
+            # Limit collection to first 10 batches per epoch to avoid OOM
+            if domain_monitor and i % 50 == 0 and i < 500:
                 domain_monitor.collect_features(
                     features_sr=source_features,
                     features_tr=target_features,
@@ -520,21 +634,40 @@ def train(opt):
         # ================================================================
         scheduler.step()
         
-        # Domain monitoring end-of-epoch analysis
+        # CRITICAL: Process and clear collected features to prevent OOM
         if domain_monitor:
-            monitor_result = domain_monitor.end_epoch(epoch)
-            LOGGER.info(f'[Monitor] {domain_monitor.mmd_tracker.get_interpretation()}')
+            try:
+                domain_monitor.end_epoch(epoch)
+            except Exception as e:
+                LOGGER.warning(f'DomainMonitor end_epoch failed: {e}')
+            # Force clear features even if end_epoch failed
+            domain_monitor._epoch_features.clear()
+            domain_monitor._epoch_labels.clear()
         
+        # Aggressive memory cleanup at end of each epoch
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Validation every 10 epochs
         if (epoch + 1) % 10 == 0 or epoch == opt.epochs - 1:
+            # Validate using state_dict copy (deepcopy fails with hooks)
+            orig_model = yolo_student.model
             try:
-                # Use Ultralytics validation
+                # Create a fresh model and load weights
+                val_yolo = YOLO(opt.weights)  # Use module-level import
+                val_model = val_yolo.model.to(device)
+                val_model.load_state_dict(model_student.state_dict())
+                val_model.eval()
+                
+                # Swap model for validation
+                yolo_student.model = val_model
+                
                 metrics = yolo_student.val(data=opt.data, split='test', verbose=False)
                 current_map50 = metrics.box.map50
                 current_map = metrics.box.map
-                
+
                 LOGGER.info(f'Epoch {epoch}: mAP@50={current_map50:.4f}, mAP@50-95={current_map:.4f}')
-                
+
                 # Log epoch metrics
                 logger.log_epoch(epoch, {
                     'mAP50': current_map50,
@@ -542,7 +675,7 @@ def train(opt):
                     'precision': metrics.box.mp,
                     'recall': metrics.box.mr,
                 })
-                
+
                 # Save best
                 if current_map50 > best_fitness:
                     best_fitness = current_map50
@@ -554,7 +687,13 @@ def train(opt):
                     }, save_dir / 'weights' / 'best.pt')
             except Exception as e:
                 LOGGER.warning(f'Validation failed (epoch {epoch}): {e}')
-        
+            finally:
+                yolo_student.model = orig_model
+                del val_model, val_yolo
+                # Force garbage collection after validation
+                gc.collect()
+                torch.cuda.empty_cache()
+
         # Save last
         torch.save({
             'epoch': epoch,
@@ -589,6 +728,9 @@ def train(opt):
 def parse_args():
     parser = argparse.ArgumentParser(description='FDA Training')
     
+    # Config file (optional - will be loaded first, then CLI args override)
+    parser.add_argument('--config', type=str, default=None, help='Path to YAML config file (e.g., configs/train_config.yaml)')
+    
     # Model
     parser.add_argument('--weights', type=str, default='yolov8n.pt', help='Pretrained weights')
     parser.add_argument('--data', type=str, default='data_v8.yaml', help='Dataset config')
@@ -604,21 +746,28 @@ def parse_args():
     parser.add_argument('--lr0', type=float, default=0.001, help='Initial learning rate')
     parser.add_argument('--lrf', type=float, default=0.01, help='Final learning rate factor')
     
-    # Teacher-Student
-    parser.add_argument('--teacher-alpha', type=float, default=0.999, help='Teacher EMA decay')
-    parser.add_argument('--conf-thres', type=float, default=0.25, help='Pseudo-label confidence')
-    parser.add_argument('--iou-thres', type=float, default=0.3, help='NMS IoU threshold')
-    parser.add_argument('--lambda-weight', type=float, default=0.005, help='Distillation weight')
+    # Teacher-Student (OPTIMIZED)
+    # teacher_alpha: 0.995 cân bằng giữa stability và adaptivity
+    # conf_thres: 0.15 bắt đầu thấp (curriculum learning)
+    # iou_thres: 0.45 standard NMS threshold
+    # lambda_weight: 0.1 đủ mạnh để distillation có tác dụng
+    parser.add_argument('--teacher-alpha', type=float, default=0.995, help='Teacher EMA decay (lower = faster adaptation)')
+    parser.add_argument('--conf-thres', type=float, default=0.15, help='Base pseudo-label confidence (adaptive)')
+    parser.add_argument('--iou-thres', type=float, default=0.45, help='NMS IoU threshold')
+    parser.add_argument('--lambda-weight', type=float, default=0.1, help='Distillation loss weight')
     
     # Progressive training
     parser.add_argument('--use-progressive-lambda', action='store_true', help='Progressive lambda')
-    parser.add_argument('--warmup-epochs', type=int, default=20, help='Warmup epochs')
+    parser.add_argument('--warmup-epochs', type=int, default=10, help='Warmup epochs for lambda')
     
-    # GRL
+    # GRL (OPTIMIZED for stability)
+    # grl_warmup: 10 epochs để detection loss ổn định trước
+    # grl_max_alpha: 0.5 tránh gradient explosion
+    # grl_weight: 0.05 nhẹ nhàng để domain alignment không phá detection
     parser.add_argument('--use-grl', action='store_true', help='Enable GRL')
-    parser.add_argument('--grl-warmup', type=int, default=5, help='GRL warmup epochs')
-    parser.add_argument('--grl-max-alpha', type=float, default=1.0, help='Max GRL alpha')
-    parser.add_argument('--grl-weight', type=float, default=0.1, help='GRL loss weight')
+    parser.add_argument('--grl-warmup', type=int, default=10, help='GRL warmup epochs')
+    parser.add_argument('--grl-max-alpha', type=float, default=0.5, help='Max GRL alpha (lower = more stable)')
+    parser.add_argument('--grl-weight', type=float, default=0.05, help='GRL loss weight')
     parser.add_argument('--grl-hidden-dim', type=int, default=256, help='Discriminator hidden dim')
     
     # Output
@@ -634,14 +783,24 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
     
+    # Load config from file if provided
+    if args.config:
+        from utils.config_loader import load_config, config_to_namespace, merge_cli_args
+        config = load_config(args.config)
+        config = merge_cli_args(config, args)
+        args = config_to_namespace(config)
+    
     print("=" * 70)
     print("FDA: Semi-Supervised Domain Adaptive Training")
     print("=" * 70)
+    print(f"Config:  {args.config if hasattr(args, 'config') and args.config else 'CLI only'}")
     print(f"Model:   {args.weights}")
     print(f"Data:    {args.data}")
     print(f"Epochs:  {args.epochs}")
+    print(f"Batch:   {args.batch}")
     print(f"Device:  cuda:{args.device}")
     print(f"GRL:     {'Enabled' if args.use_grl else 'Disabled'}")
+    print(f"Warmup:  {args.warmup_epochs} epochs")
     print("=" * 70)
     
     train(args)

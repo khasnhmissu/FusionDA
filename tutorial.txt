@@ -38,20 +38,36 @@ cd ..
 datasets/
 ├── source_real/
 │   └── source_real/     ← nested folder from zip
-│       ├── images/train/
-│       └── labels/train/
+│       ├── train/
+│       │   ├── images/
+│       │   └── labels/
+│       └── val/
+│           ├── images/
+│           └── labels/
 ├── source_fake/
 │   └── source_fake/
-│       ├── images/train/
-│       └── labels/train/
+│       ├── train/
+│       │   ├── images/
+│       │   └── labels/
+│       └── val/
+│           ├── images/
+│           └── labels/
 ├── target_real/
 │   └── target_real/
-│       ├── images/train/
-│       └── labels/train/
+│       ├── train/
+│       │   ├── images/
+│       │   └── labels/
+│       └── val/
+│           ├── images/
+│           └── labels/
 └── target_fake/
     └── target_fake/
-        ├── images/train/
-        └── labels/train/
+        ├── train/
+        │   ├── images/
+        │   └── labels/
+        └── val/
+            ├── images/
+            └── labels/
 ```
 
 ### Train

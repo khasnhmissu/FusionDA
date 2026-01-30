@@ -144,6 +144,7 @@ class DomainMonitor:
         features_tf: torch.Tensor = None,
         labels_sr: torch.Tensor = None,
         labels_tr: torch.Tensor = None,
+        max_batches: int = 10,  # Limit to prevent OOM
     ):
         """
         Collect features for end-of-epoch analysis.
@@ -153,7 +154,12 @@ class DomainMonitor:
         Args:
             features_*: Feature tensors [B, C, H, W] or [B, D]
             labels_*: Class labels [B]
+            max_batches: Maximum number of batches to keep (older ones are dropped)
         """
+        # Check if we've reached the limit - if so, skip collection
+        if len(self._epoch_features.get('sr', [])) >= max_batches:
+            return
+        
         if features_sr is not None:
             self._epoch_features['sr'].append(features_sr.detach().cpu())
         if features_sf is not None:

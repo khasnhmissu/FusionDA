@@ -11,17 +11,33 @@ class WeightEMA:
         self.teacher_params = list(teacher_params)
         self.student_params = list(student_params)
         self.alpha = alpha
+        self.step_count = 0
+        self.nan_count = 0  # Track NaN occurrences
         
         # Initialize teacher = student
         for t_param, s_param in zip(self.teacher_params, self.student_params):
             t_param.data.copy_(s_param.data)
     
     def step(self):
-        """Update teacher params with EMA of student params"""
+        """Update teacher params with EMA of student params.
+        
+        Includes NaN protection: if student weights contain NaN/Inf,
+        skip update to preserve teacher integrity.
+        """
+        # Check for NaN in student params BEFORE updating
+        for s_param in self.student_params:
+            if torch.isnan(s_param.data).any() or torch.isinf(s_param.data).any():
+                self.nan_count += 1
+                if self.nan_count <= 5:  # Only warn first 5 times
+                    print(f"[EMA WARNING] Student weights contain NaN/Inf, skipping EMA update (count={self.nan_count})")
+                return  # Skip this update entirely
+        
         one_minus_alpha = 1.0 - self.alpha
         for t_param, s_param in zip(self.teacher_params, self.student_params):
             t_param.data.mul_(self.alpha)
             t_param.data.add_(s_param.data * one_minus_alpha)
+        
+        self.step_count += 1
             
             
 # ============================================================================
@@ -106,8 +122,27 @@ class FDALoss:
     Combined loss for FDA training.
     Uses Ultralytics v8DetectionLoss internally.
     """
-    def __init__(self, model):
+    def __init__(self, model, class_mapping=None):
+        """
+        Args:
+            model: YOLOv8 detection model
+            class_mapping: Dict mapping class IDs to dataset class IDs.
+                          Must include BOTH:
+                          - COCO class IDs (for early training when Teacher still outputs COCO)
+                          - Dataset class IDs (for later training after Teacher adapts via EMA)
+                          Default: {0: 0, 1: 1, 2: 1, 5: 1, 7: 1}
+        """
         from ultralytics.utils import IterableSimpleNamespace
+        
+        # Store class mapping for pseudo-label processing
+        # IMPORTANT: Include both COCO and dataset class IDs!
+        # - Early training: Teacher outputs COCO IDs (0, 2)
+        # - Later training: Teacher (via EMA) outputs dataset IDs (0, 1)
+        self.class_mapping = class_mapping or {
+            0: 0,   # person (both COCO and dataset)
+            1: 1,   # dataset car → car (for EMA-adapted Teacher)
+            2: 1,   # COCO car → car
+        }
         
         # Create complete hyp config with ALL required attributes
         # Including loss weights that get_cfg() doesn't provide
@@ -212,14 +247,35 @@ class FDALoss:
             
             # preds format: [x1, y1, x2, y2, conf, cls]
             boxes_xyxy = preds[:, :4]
-            classes = preds[:, 5]
+            coco_classes = preds[:, 5]
+            
+            # ============================================================
+            # COCO to Dataset class mapping (configurable via class_mapping)
+            # ============================================================
+            coco_to_dataset = self.class_mapping
+            
+            # Filter and remap classes
+            valid_mask = torch.zeros(len(preds), dtype=torch.bool, device=preds.device)
+            remapped_classes = torch.zeros_like(coco_classes)
+            
+            for coco_cls, dataset_cls in coco_to_dataset.items():
+                mask = coco_classes == coco_cls
+                valid_mask |= mask
+                remapped_classes[mask] = dataset_cls
+            
+            # Only keep valid predictions
+            if valid_mask.sum() == 0:
+                continue
+                
+            boxes_xyxy = boxes_xyxy[valid_mask]
+            classes = remapped_classes[valid_mask]
             
             # Convert to normalized xywh
             boxes_xywhn = xyxy2xywhn(boxes_xyxy, w=img_w, h=img_h)
             
             all_cls.append(classes)
             all_bboxes.append(boxes_xywhn)
-            all_batch_idx.append(torch.full((len(preds),), batch_idx, device=preds.device))
+            all_batch_idx.append(torch.full((valid_mask.sum().item(),), batch_idx, device=preds.device))
         
         if not all_cls:
             return {

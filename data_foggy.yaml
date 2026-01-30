@@ -8,6 +8,6 @@ names:
   0: person
   1: car
 
-train: target_real/target_real/images
-val: target_real/target_real/images
-test: target_real/target_real/images
+train: target_real/target_real/train/images
+val: target_real/target_real/val/images
+test: target_real/target_real/val/images

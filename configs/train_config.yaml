@@ -1,0 +1,92 @@
+# ============================================================================
+# FusionDA Training Configuration
+# ============================================================================
+# All hyperparameters and settings for domain adaptive training.
+# Override via command line: python train.py --config train_config.yaml --epochs 200
+# ============================================================================
+
+# =========================
+# Model & Data
+# =========================
+model:
+  weights: "yolov8l.pt"           # Pretrained weights path
+  imgsz: 640                      # Input image size
+
+data:
+  config: "data.yaml"             # Dataset configuration file
+  workers: 8                      # Number of dataloader workers
+  batch_size: 4                   # Batch size per GPU
+
+# =========================
+# Training Schedule
+# =========================
+training:
+  epochs: 200                     # Total training epochs
+  warmup_epochs: 10               # Warmup period (no distillation loss weight)
+  
+  # Learning rate
+  lr0: 0.0005                     # Initial learning rate (reduced for stability)
+  lrf: 0.01                       # Final learning rate (lr0 * lrf)
+  
+  # Device
+  device: "0"                     # GPU device (0, 1, 2, ... or "cpu")
+
+# =========================
+# Teacher-Student (EMA)
+# =========================
+teacher:
+  alpha: 0.999                    # EMA decay rate (higher = slower update)
+  ema_warmup_ratio: 0.5           # Start EMA after this fraction of warmup_epochs
+  
+# =========================
+# Pseudo-Label & Distillation
+# =========================
+distillation:
+  # Confidence thresholds (curriculum learning: low -> high)
+  conf_thres_min: 0.15            # Min confidence at start
+  conf_thres_max: 0.50            # Max confidence at end
+  iou_thres: 0.45                 # IoU threshold for NMS
+  
+  # Loss weight
+  lambda_weight: 0.1              # Distillation loss weight
+  use_progressive_lambda: true    # Increase lambda over epochs
+  
+  # Class mapping: COCO/Dataset -> Dataset
+  # IMPORTANT: Include BOTH COCO IDs (early training) AND dataset IDs (after EMA adaptation)
+  class_mapping:
+    0: 0    # person (both COCO and dataset)
+    1: 1    # dataset car (for EMA-adapted Teacher)
+    2: 1    # COCO car
+
+# =========================
+# Domain Adversarial (GRL)
+# =========================
+grl:
+  enabled: true                   # Enable Gradient Reversal Layer
+  warmup_epochs: 10               # Warmup before GRL activates
+  max_alpha: 0.5                  # Maximum GRL alpha value
+  weight: 0.05                    # Domain loss weight
+  hidden_dim: 256                 # Discriminator hidden dimension
+  dropout: 0.3                    # Discriminator dropout rate
+  lr: 0.0001                      # GRL optimizer learning rate
+
+# =========================
+# Output & Logging
+# =========================
+output:
+  project: "runs/fda"             # Output project directory
+  name: "exp"                     # Experiment name
+  
+logging:
+  log_interval: 100               # Log every N iterations
+  val_interval: 10                # Validate every N epochs
+  save_interval: 10               # Save checkpoint every N epochs
+  enable_monitoring: true         # Enable domain distribution monitoring
+
+# =========================
+# Memory & Performance
+# =========================
+performance:
+  amp: true                       # Use Automatic Mixed Precision
+  cache_clear_interval: 200       # Clear CUDA cache every N iterations
+  gradient_clip: 10.0             # Gradient clipping max norm
