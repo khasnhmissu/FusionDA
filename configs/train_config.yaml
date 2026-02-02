@@ -25,7 +25,7 @@ training:
   warmup_epochs: 10               # Warmup period (no distillation loss weight)
   
   # Learning rate
-  lr0: 0.0005                     # Initial learning rate (reduced for stability)
+  lr0: 0.0001                     # Initial learning rate (reduced for stability with multiple losses)
   lrf: 0.01                       # Final learning rate (lr0 * lrf)
   
   # Device
@@ -36,7 +36,7 @@ training:
 # =========================
 teacher:
   alpha: 0.999                    # EMA decay rate (higher = slower update)
-  ema_warmup_ratio: 0.5           # Start EMA after this fraction of warmup_epochs
+  ema_warmup_epochs: 3            # Delay EMA updates until this epoch (student needs to learn first)
   
 # =========================
 # Pseudo-Label & Distillation
@@ -51,12 +51,16 @@ distillation:
   lambda_weight: 0.1              # Distillation loss weight
   use_progressive_lambda: true    # Increase lambda over epochs
   
-  # Class mapping: COCO/Dataset -> Dataset
-  # IMPORTANT: Include BOTH COCO IDs (early training) AND dataset IDs (after EMA adaptation)
+  # Class mapping: Input class ID -> Dataset class ID
+  # COCO: 0=person, 2=car
+  # Dataset: 0=person, 1=car
+  # IMPORTANT: Include BOTH to handle:
+  #   - Early training: teacher outputs COCO IDs (0, 2)
+  #   - After EMA: teacher outputs Dataset IDs (0, 1)
   class_mapping:
-    0: 0    # person (both COCO and dataset)
-    1: 1    # dataset car (for EMA-adapted Teacher)
-    2: 1    # COCO car
+    0: 0    # person (COCO and Dataset)
+    1: 1    # car (Dataset, after EMA adaptation)
+    2: 1    # car (COCO, early training)
 
 # =========================
 # Domain Adversarial (GRL)
@@ -64,7 +68,7 @@ distillation:
 grl:
   enabled: true                   # Enable Gradient Reversal Layer
   warmup_epochs: 10               # Warmup before GRL activates
-  max_alpha: 0.5                  # Maximum GRL alpha value
+  max_alpha: 0.3                  # Maximum GRL alpha value (reduced for stability)
   weight: 0.05                    # Domain loss weight
   hidden_dim: 256                 # Discriminator hidden dimension
   dropout: 0.3                    # Discriminator dropout rate
@@ -89,4 +93,4 @@ logging:
 performance:
   amp: true                       # Use Automatic Mixed Precision
   cache_clear_interval: 200       # Clear CUDA cache every N iterations
-  gradient_clip: 10.0             # Gradient clipping max norm
+  gradient_clip: 2.0              # Gradient clipping max norm (reduced for stability)

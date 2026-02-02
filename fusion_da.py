@@ -1,43 +1,148 @@
 import torch
+import torch.nn as nn
+from copy import deepcopy
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.ops import xyxy2xywhn
 from ultralytics.cfg import get_cfg
 
-class WeightEMA:
+
+class WeightEMA(nn.Module):
     """
-    Exponential Moving Average for teacher model.
-    """
-    def __init__(self, teacher_params, student_params, alpha=0.999):
-        self.teacher_params = list(teacher_params)
-        self.student_params = list(student_params)
-        self.alpha = alpha
-        self.step_count = 0
-        self.nan_count = 0  # Track NaN occurrences
-        
-        # Initialize teacher = student
-        for t_param, s_param in zip(self.teacher_params, self.student_params):
-            t_param.data.copy_(s_param.data)
+    Model Exponential Moving Average following timm.ModelEmaV2 best practices.
     
-    def step(self):
-        """Update teacher params with EMA of student params.
-        
-        Includes NaN protection: if student weights contain NaN/Inf,
-        skip update to preserve teacher integrity.
+    CRITICAL DIFFERENCES FROM OLD IMPLEMENTATION:
+    1. Uses deepcopy() to create an INDEPENDENT EMA model
+    2. Iterates through state_dict().values() for ALL params + buffers
+    3. EMA model is ALWAYS in eval() mode
+    4. Uses lerp_() for efficient in-place EMA updates
+    
+    The old implementation was broken because teacher and student shared references,
+    causing corruption when student weights changed during training.
+    
+    Reference: https://github.com/huggingface/pytorch-image-models/blob/main/timm/utils/model_ema.py
+    """
+    
+    def __init__(self, model, decay=0.9999, device=None):
         """
-        # Check for NaN in student params BEFORE updating
-        for s_param in self.student_params:
-            if torch.isnan(s_param.data).any() or torch.isinf(s_param.data).any():
-                self.nan_count += 1
-                if self.nan_count <= 5:  # Only warn first 5 times
-                    print(f"[EMA WARNING] Student weights contain NaN/Inf, skipping EMA update (count={self.nan_count})")
-                return  # Skip this update entirely
+        Initialize EMA with a deepcopy of the source model.
         
-        one_minus_alpha = 1.0 - self.alpha
-        for t_param, s_param in zip(self.teacher_params, self.student_params):
-            t_param.data.mul_(self.alpha)
-            t_param.data.add_(s_param.data * one_minus_alpha)
+        Args:
+            model: Source model to create EMA from (will be deepcopied)
+            decay: EMA decay rate (higher = slower adaptation, 0.9999 typical)
+            device: Device to place EMA model on (None = same as source)
+        """
+        super().__init__()
+        
+        # CRITICAL: deepcopy creates completely independent model
+        # This prevents the corruption that occurred in the old implementation
+        self.module = deepcopy(model)
+        self.module.eval()  # EMA model is ALWAYS in eval mode
+        
+        self.decay = decay
+        self.device = device
+        self.step_count = 0
+        self.nan_count = 0
+        
+        if device is not None:
+            self.module.to(device=device)
+        
+        # Disable gradients for EMA model - it's never trained directly
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+        
+        # Count total state_dict entries for logging
+        n_params = sum(1 for _ in self.module.parameters())
+        n_buffers = sum(1 for _ in self.module.buffers())
+        print(f"[EMA] Initialized with decay={decay}, {n_params} params, {n_buffers} buffers")
+        print(f"[EMA] Using timm-style implementation with deepcopy + state_dict iteration")
+    
+    @torch.no_grad()
+    def update(self, model, decay=None):
+        """
+        Update EMA model with current model weights.
+        
+        Uses state_dict iteration to update ALL values (params + buffers).
+        Non-floating point buffers (like num_batches_tracked) are copied directly.
+        
+        Args:
+            model: Source model with updated weights
+            decay: Override decay value (optional)
+        """
+        d = decay if decay is not None else self.decay
+        
+        # Get state dicts - these iterate in consistent order
+        ema_state = self.module.state_dict()
+        model_state = model.state_dict()
+        
+        # Verify state dicts have same keys
+        if ema_state.keys() != model_state.keys():
+            print(f"[EMA WARNING] State dict key mismatch! EMA has {len(ema_state)} keys, model has {len(model_state)} keys")
+            # Find missing/extra keys for debugging
+            ema_only = set(ema_state.keys()) - set(model_state.keys())
+            model_only = set(model_state.keys()) - set(ema_state.keys())
+            if ema_only:
+                print(f"[EMA WARNING] Keys only in EMA: {list(ema_only)[:5]}...")
+            if model_only:
+                print(f"[EMA WARNING] Keys only in model: {list(model_only)[:5]}...")
+        
+        # Check for NaN/Inf in source model BEFORE updating
+        for key, model_v in model_state.items():
+            if model_v.is_floating_point():
+                if torch.isnan(model_v).any() or torch.isinf(model_v).any():
+                    self.nan_count += 1
+                    if self.nan_count <= 5:
+                        print(f"[EMA WARNING] Source model has NaN/Inf in '{key}', skipping update (count={self.nan_count})")
+                    return
+        
+        # Iterate through state_dict values (params + buffers)
+        for ema_v, model_v in zip(ema_state.values(), model_state.values()):
+            if ema_v.is_floating_point():
+                # EMA update: ema = decay * ema + (1 - decay) * model
+                # lerp_() is more numerically stable than mul_() + add_()
+                # lerp_(end, weight) computes: self + weight * (end - self)
+                # With weight = (1 - decay), this gives: ema + (1-d)*(model - ema) = d*ema + (1-d)*model
+                device = self.device if self.device is not None else model_v.device
+                ema_v.lerp_(model_v.to(device=device), weight=1.0 - d)
+            else:
+                # Non-floating buffers (like num_batches_tracked): copy directly
+                ema_v.copy_(model_v)
         
         self.step_count += 1
+        
+        # Periodic verification
+        if self.step_count % 500 == 0:
+            valid = self._verify_weights()
+            if valid:
+                print(f"[EMA] Step {self.step_count} completed successfully")
+    
+    def _verify_weights(self):
+        """Check EMA model weights for NaN/Inf."""
+        for name, param in self.module.named_parameters():
+            if torch.isnan(param.data).any():
+                print(f"[EMA ERROR] EMA param '{name}' has NaN")
+                return False
+            if torch.isinf(param.data).any():
+                print(f"[EMA ERROR] EMA param '{name}' has Inf")
+                return False
+        for name, buf in self.module.named_buffers():
+            if buf.is_floating_point():
+                if torch.isnan(buf).any():
+                    print(f"[EMA ERROR] EMA buffer '{name}' has NaN")
+                    return False
+                if torch.isinf(buf).any():
+                    print(f"[EMA ERROR] EMA buffer '{name}' has Inf")
+                    return False
+        return True
+    
+    def forward(self, *args, **kwargs):
+        """Forward pass through EMA model (always in eval mode)."""
+        return self.module(*args, **kwargs)
+    
+    # Backward compatibility aliases
+    def step(self):
+        """Deprecated: Use update(model) instead. This is a no-op for compatibility."""
+        print("[EMA WARNING] step() is deprecated. Use update(model) instead.")
+        pass
             
             
 # ============================================================================
@@ -222,13 +327,13 @@ class FDALoss:
             img_shape: (height, width) of input images
         """
         if pseudo_targets is None or len(pseudo_targets) == 0:
-            return torch.tensor(0.0, device=self.device)
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
         
         # Convert pseudo-labels to batch format for Ultralytics loss
         batch = self._format_pseudo_targets(pseudo_targets, img_shape)
         
         if batch['cls'].numel() == 0:
-            return torch.tensor(0.0, device=self.device)
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
         
         loss, loss_items = self.detection_loss(student_preds, batch)
         return loss

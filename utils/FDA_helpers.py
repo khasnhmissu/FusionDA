@@ -1,25 +1,28 @@
 import math
 
-def get_adaptive_conf_thres(epoch, total_epochs, base_conf=0.5, min_conf=0.15, max_conf=0.5):
+def get_adaptive_conf_thres(epoch, total_epochs, base_conf=0.35, min_conf=None, max_conf=0.7):
     """
     Adaptive confidence threshold với curriculum learning.
-    Bắt đầu thấp (lấy nhiều pseudo-labels) rồi tăng dần (lọc chất lượng cao hơn).
+    Bắt đầu từ base_conf rồi tăng dần đến max_conf để lọc chất lượng cao hơn.
     
     Args:
         epoch: Current epoch
         total_epochs: Total epochs
-        base_conf: Base confidence (unused, kept for compatibility)
-        min_conf: Minimum confidence threshold (start of training)
+        base_conf: Base confidence threshold (start of training) - from CLI --conf-thres
+        min_conf: Deprecated, use base_conf instead
         max_conf: Maximum confidence threshold (end of training)
     
     Returns:
         conf_thres: Confidence threshold for current epoch
     """
+    # Use base_conf as the starting point
+    start_conf = base_conf if min_conf is None else min_conf
+    
     progress = epoch / max(total_epochs, 1)
-    # Curriculum learning: start low, increase gradually
+    # Curriculum learning: start from base_conf, increase to max_conf
     # cos(0) = 1, cos(pi) = -1
     # (1 - cos(pi * progress)) / 2: 0 -> 1
-    conf_thres = min_conf + (max_conf - min_conf) * (1 - math.cos(math.pi * progress)) / 2
+    conf_thres = start_conf + (max_conf - start_conf) * (1 - math.cos(math.pi * progress)) / 2
     return conf_thres
 
 def filter_pseudo_labels_by_uncertainty(predictions, min_confidence=0.3):

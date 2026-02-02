@@ -205,6 +205,7 @@ def get_grl_alpha(epoch, total_epochs, warmup_epochs=10, max_alpha=1.0):
     
     # Quadratic schedule - smoother and more stable than sigmoid
     # Prevents sudden alpha jumps that cause gradient explosion
+    # Recommend max_alpha <= 0.3 for stability with YOLOv8
     alpha = max_alpha * (progress ** 2)
     
     return alpha
