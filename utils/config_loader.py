@@ -34,7 +34,7 @@ class TrainingConfig:
 @dataclass
 class TeacherConfig:
     alpha: float = 0.999
-    ema_warmup_ratio: float = 0.5
+    ema_warmup_epochs: int = 1  # EMA warmup: only 1 epoch delay
 
 
 @dataclass
@@ -194,7 +194,7 @@ def config_to_namespace(config: FDAConfig) -> Namespace:
     
     # Teacher
     ns.teacher_alpha = config.teacher.alpha
-    ns.ema_warmup_ratio = config.teacher.ema_warmup_ratio
+    ns.ema_warmup_epochs = config.teacher.ema_warmup_epochs
     
     # Distillation
     ns.conf_thres = config.distillation.conf_thres_min

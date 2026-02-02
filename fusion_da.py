@@ -54,15 +54,18 @@ class WeightEMA(nn.Module):
         n_params = sum(1 for _ in self.module.parameters())
         n_buffers = sum(1 for _ in self.module.buffers())
         print(f"[EMA] Initialized with decay={decay}, {n_params} params, {n_buffers} buffers")
-        print(f"[EMA] Using timm-style implementation with deepcopy + state_dict iteration")
+        print(f"[EMA] Using timm-style implementation with deepcopy + direct param iteration")
     
     @torch.no_grad()
     def update(self, model, decay=None):
         """
         Update EMA model with current model weights.
         
-        Uses state_dict iteration to update ALL values (params + buffers).
-        Non-floating point buffers (like num_batches_tracked) are copied directly.
+        CRITICAL FIX: Use zip(module.parameters(), model.parameters()) and 
+        named_buffers() to get ACTUAL tensor references, not copies!
+        
+        state_dict().values() returns COPIES of tensors, so in-place ops
+        on those copies don't affect the actual model weights.
         
         Args:
             model: Source model with updated weights
@@ -70,42 +73,38 @@ class WeightEMA(nn.Module):
         """
         d = decay if decay is not None else self.decay
         
-        # Get state dicts - these iterate in consistent order
-        ema_state = self.module.state_dict()
-        model_state = model.state_dict()
+        # ================================================================
+        # PART 1: Update parameters (weights, biases)
+        # ================================================================
+        for ema_p, model_p in zip(self.module.parameters(), model.parameters()):
+            # Check for NaN/Inf in source
+            if torch.isnan(model_p.data).any() or torch.isinf(model_p.data).any():
+                self.nan_count += 1
+                if self.nan_count <= 5:
+                    print(f"[EMA WARNING] Source param has NaN/Inf, skipping update (count={self.nan_count})")
+                return
+            
+            # EMA update: ema = decay * ema + (1 - decay) * model
+            # lerp_(end, weight) = self + weight * (end - self)
+            # With weight = (1-d): ema + (1-d)*(model - ema) = d*ema + (1-d)*model
+            ema_p.data.lerp_(model_p.data, weight=1.0 - d)
         
-        # Verify state dicts have same keys
-        if ema_state.keys() != model_state.keys():
-            print(f"[EMA WARNING] State dict key mismatch! EMA has {len(ema_state)} keys, model has {len(model_state)} keys")
-            # Find missing/extra keys for debugging
-            ema_only = set(ema_state.keys()) - set(model_state.keys())
-            model_only = set(model_state.keys()) - set(ema_state.keys())
-            if ema_only:
-                print(f"[EMA WARNING] Keys only in EMA: {list(ema_only)[:5]}...")
-            if model_only:
-                print(f"[EMA WARNING] Keys only in model: {list(model_only)[:5]}...")
-        
-        # Check for NaN/Inf in source model BEFORE updating
-        for key, model_v in model_state.items():
-            if model_v.is_floating_point():
-                if torch.isnan(model_v).any() or torch.isinf(model_v).any():
-                    self.nan_count += 1
-                    if self.nan_count <= 5:
-                        print(f"[EMA WARNING] Source model has NaN/Inf in '{key}', skipping update (count={self.nan_count})")
-                    return
-        
-        # Iterate through state_dict values (params + buffers)
-        for ema_v, model_v in zip(ema_state.values(), model_state.values()):
-            if ema_v.is_floating_point():
-                # EMA update: ema = decay * ema + (1 - decay) * model
-                # lerp_() is more numerically stable than mul_() + add_()
-                # lerp_(end, weight) computes: self + weight * (end - self)
-                # With weight = (1 - decay), this gives: ema + (1-d)*(model - ema) = d*ema + (1-d)*model
-                device = self.device if self.device is not None else model_v.device
-                ema_v.lerp_(model_v.to(device=device), weight=1.0 - d)
-            else:
-                # Non-floating buffers (like num_batches_tracked): copy directly
-                ema_v.copy_(model_v)
+        # ================================================================
+        # PART 2: Update buffers (BatchNorm running_mean, running_var, etc.)
+        # ================================================================
+        ema_buffers = dict(self.module.named_buffers())
+        for name, model_buf in model.named_buffers():
+            if name in ema_buffers:
+                ema_buf = ema_buffers[name]
+                if ema_buf.is_floating_point():
+                    # Check for NaN/Inf
+                    if torch.isnan(model_buf).any() or torch.isinf(model_buf).any():
+                        continue  # Skip this buffer but continue with others
+                    # EMA update for floating point buffers
+                    ema_buf.lerp_(model_buf, weight=1.0 - d)
+                else:
+                    # Non-floating buffers (like num_batches_tracked): copy directly
+                    ema_buf.copy_(model_buf)
         
         self.step_count += 1
         

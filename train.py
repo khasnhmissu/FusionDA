@@ -835,9 +835,9 @@ def train(opt):
             # Update teacher with EMA - but only after warmup period
             # Student needs to learn basic patterns before EMA starts
             # Otherwise student's random weights will corrupt pretrained teacher
-            ema_warmup_epochs = getattr(opt, 'ema_warmup_epochs', 5)  # Default: wait 5 epochs
+            ema_warmup_epochs = getattr(opt, 'ema_warmup_epochs', 1)  # Default: wait 1 epoch
             if epoch >= ema_warmup_epochs:
-                # NEW: timm-style EMA update - pass student model directly
+                # timm-style EMA update - pass student model directly
                 teacher_ema.update(model_student)
             elif i == 0:  # Log once per epoch during warmup
                 LOGGER.info(f'[EMA] Warmup: keeping pretrained teacher until epoch {ema_warmup_epochs}')

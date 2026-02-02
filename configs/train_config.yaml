@@ -36,7 +36,7 @@ training:
 # =========================
 teacher:
   alpha: 0.999                    # EMA decay rate (higher = slower update)
-  ema_warmup_epochs: 3            # Delay EMA updates until this epoch (student needs to learn first)
+  ema_warmup_epochs: 1           # Delay EMA updates until this epoch (student needs to learn first)
   
 # =========================
 # Pseudo-Label & Distillation
