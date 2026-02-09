@@ -1,7 +1,4 @@
-"""
-Configuration loader for FusionDA training.
-Handles loading, merging, and validating config files.
-"""
+"""Configuration loader for FusionDA training."""
 import yaml
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -33,14 +30,15 @@ class TrainingConfig:
 
 @dataclass
 class TeacherConfig:
+    """EMA config: θ_teacher = α * θ_teacher + (1-α) * θ_student"""
     alpha: float = 0.999
-    ema_warmup_epochs: int = 1  # EMA warmup: only 1 epoch delay
+    freeze_teacher: bool = False
 
 
 @dataclass
 class DistillationConfig:
-    conf_thres_min: float = 0.15
-    conf_thres_max: float = 0.50
+    conf_thres_min: float = 0.5
+    conf_thres_max: float = 0.7
     iou_thres: float = 0.45
     lambda_weight: float = 0.1
     use_progressive_lambda: bool = True
@@ -94,15 +92,7 @@ class FDAConfig:
 
 
 def load_config(config_path: Optional[str] = None) -> FDAConfig:
-    """
-    Load configuration from YAML file.
-    
-    Args:
-        config_path: Path to YAML config file. If None, use defaults.
-        
-    Returns:
-        FDAConfig object with all settings.
-    """
+    """Load configuration from YAML file."""
     config = FDAConfig()
     
     if config_path is None:
@@ -120,60 +110,29 @@ def load_config(config_path: Optional[str] = None) -> FDAConfig:
         return config
     
     # Update each section
-    if 'model' in yaml_config:
-        for k, v in yaml_config['model'].items():
-            if hasattr(config.model, k):
-                setattr(config.model, k, v)
+    section_mapping = {
+        'model': config.model,
+        'data': config.data,
+        'training': config.training,
+        'teacher': config.teacher,
+        'distillation': config.distillation,
+        'grl': config.grl,
+        'output': config.output,
+        'logging': config.logging,
+        'performance': config.performance,
+    }
     
-    if 'data' in yaml_config:
-        for k, v in yaml_config['data'].items():
-            if hasattr(config.data, k):
-                setattr(config.data, k, v)
-    
-    if 'training' in yaml_config:
-        for k, v in yaml_config['training'].items():
-            if hasattr(config.training, k):
-                setattr(config.training, k, v)
-    
-    if 'teacher' in yaml_config:
-        for k, v in yaml_config['teacher'].items():
-            if hasattr(config.teacher, k):
-                setattr(config.teacher, k, v)
-    
-    if 'distillation' in yaml_config:
-        for k, v in yaml_config['distillation'].items():
-            if hasattr(config.distillation, k):
-                setattr(config.distillation, k, v)
-    
-    if 'grl' in yaml_config:
-        for k, v in yaml_config['grl'].items():
-            if hasattr(config.grl, k):
-                setattr(config.grl, k, v)
-    
-    if 'output' in yaml_config:
-        for k, v in yaml_config['output'].items():
-            if hasattr(config.output, k):
-                setattr(config.output, k, v)
-    
-    if 'logging' in yaml_config:
-        for k, v in yaml_config['logging'].items():
-            if hasattr(config.logging, k):
-                setattr(config.logging, k, v)
-    
-    if 'performance' in yaml_config:
-        for k, v in yaml_config['performance'].items():
-            if hasattr(config.performance, k):
-                setattr(config.performance, k, v)
+    for section_name, section_obj in section_mapping.items():
+        if section_name in yaml_config:
+            for k, v in yaml_config[section_name].items():
+                if hasattr(section_obj, k):
+                    setattr(section_obj, k, v)
     
     return config
 
 
 def config_to_namespace(config: FDAConfig) -> Namespace:
-    """
-    Convert FDAConfig to flat Namespace for backward compatibility.
-    
-    This allows existing code using opt.epochs, opt.batch, etc. to work.
-    """
+    """Convert FDAConfig to flat Namespace for backward compatibility."""
     ns = Namespace()
     
     # Model
@@ -194,7 +153,7 @@ def config_to_namespace(config: FDAConfig) -> Namespace:
     
     # Teacher
     ns.teacher_alpha = config.teacher.alpha
-    ns.ema_warmup_epochs = config.teacher.ema_warmup_epochs
+    ns.freeze_teacher = config.teacher.freeze_teacher
     
     # Distillation
     ns.conf_thres = config.distillation.conf_thres_min
@@ -232,11 +191,7 @@ def config_to_namespace(config: FDAConfig) -> Namespace:
 
 
 def merge_cli_args(config: FDAConfig, args: Namespace) -> FDAConfig:
-    """
-    Merge command-line arguments into config.
-    CLI args take precedence over config file.
-    """
-    # Map CLI args to config attributes
+    """Merge CLI arguments into config. CLI takes precedence."""
     cli_mapping = {
         'weights': ('model', 'weights'),
         'imgsz': ('model', 'imgsz'),
@@ -250,6 +205,8 @@ def merge_cli_args(config: FDAConfig, args: Namespace) -> FDAConfig:
         'name': ('output', 'name'),
         'project': ('output', 'project'),
         'enable_monitoring': ('logging', 'enable_monitoring'),
+        'teacher_alpha': ('teacher', 'alpha'),
+        'freeze_teacher': ('teacher', 'freeze_teacher'),
     }
     
     for arg_name, (section, attr) in cli_mapping.items():
@@ -265,8 +222,6 @@ def merge_cli_args(config: FDAConfig, args: Namespace) -> FDAConfig:
 
 def print_config(config: FDAConfig):
     """Print configuration summary."""
-    print("=" * 60)
-    print("FusionDA Training Configuration")
     print("=" * 60)
     print(f"Model:     {config.model.weights}")
     print(f"Data:      {config.data.config}")

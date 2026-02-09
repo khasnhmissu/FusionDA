@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from copy import deepcopy
+from typing import Optional
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.ops import xyxy2xywhn
 from ultralytics.cfg import get_cfg
@@ -8,180 +9,205 @@ from ultralytics.cfg import get_cfg
 
 class WeightEMA(nn.Module):
     """
-    Model Exponential Moving Average following timm.ModelEmaV2 best practices.
+    Exponential Moving Average for Mean Teacher.
     
-    CRITICAL DIFFERENCES FROM OLD IMPLEMENTATION:
-    1. Uses deepcopy() to create an INDEPENDENT EMA model
-    2. Iterates through state_dict().values() for ALL params + buffers
-    3. EMA model is ALWAYS in eval() mode
-    4. Uses lerp_() for efficient in-place EMA updates
+    θ_teacher = α * θ_teacher + (1-α) * θ_student
     
-    The old implementation was broken because teacher and student shared references,
-    causing corruption when student weights changed during training.
-    
-    Reference: https://github.com/huggingface/pytorch-image-models/blob/main/timm/utils/model_ema.py
+    Key design:
+    - Only parameters updated, buffers (BatchNorm) stay frozen
+    - Teacher always in eval mode
+    - Call update() AFTER optimizer.step()
+    - update_after_step: Delay EMA updates to let student stabilize
     """
     
-    def __init__(self, model, decay=0.9999, device=None):
-        """
-        Initialize EMA with a deepcopy of the source model.
-        
-        Args:
-            model: Source model to create EMA from (will be deepcopied)
-            decay: EMA decay rate (higher = slower adaptation, 0.9999 typical)
-            device: Device to place EMA model on (None = same as source)
-        """
+    def __init__(
+            self,
+            model,
+            alpha: float = 0.999,
+            freeze_teacher: bool = False,
+            device: Optional[torch.device] = None,
+            update_after_step: int = 500,  # Delay EMA updates
+    ):
         super().__init__()
         
-        # CRITICAL: deepcopy creates completely independent model
-        # This prevents the corruption that occurred in the old implementation
+        # Create independent copy
         self.module = deepcopy(model)
-        self.module.eval()  # EMA model is ALWAYS in eval mode
+        self.module.eval()
         
-        self.decay = decay
+        self.alpha = alpha
+        self.freeze_teacher = freeze_teacher
         self.device = device
+        self.update_after_step = update_after_step
+        self.updates = 0
         self.step_count = 0
         self.nan_count = 0
         
         if device is not None:
             self.module.to(device=device)
         
-        # Disable gradients for EMA model - it's never trained directly
+        # Disable gradients - teacher is never trained directly
         for p in self.module.parameters():
             p.requires_grad_(False)
         
-        # Count total state_dict entries for logging
         n_params = sum(1 for _ in self.module.parameters())
         n_buffers = sum(1 for _ in self.module.buffers())
-        print(f"[EMA] Initialized with decay={decay}, {n_params} params, {n_buffers} buffers")
-        print(f"[EMA] Using timm-style implementation with deepcopy + direct param iteration")
+        
+        if freeze_teacher:
+            print(f"[WeightEMA] FREEZE: Teacher stays pretrained")
+        else:
+            print(f"[WeightEMA] alpha={alpha}, {n_params} params (EMA), {n_buffers} buffers (frozen)")
+            print(f"[WeightEMA] EMA updates start after step {update_after_step}")
     
     @torch.no_grad()
-    def update(self, model, decay=None):
-        """
-        Update EMA model with current model weights.
-        
-        CRITICAL FIX: Use zip(module.parameters(), model.parameters()) and 
-        named_buffers() to get ACTUAL tensor references, not copies!
-        
-        state_dict().values() returns COPIES of tensors, so in-place ops
-        on those copies don't affect the actual model weights.
-        
-        Args:
-            model: Source model with updated weights
-            decay: Override decay value (optional)
-        """
-        d = decay if decay is not None else self.decay
-        
-        # ================================================================
-        # PART 1: Update parameters (weights, biases)
-        # ================================================================
-        for ema_p, model_p in zip(self.module.parameters(), model.parameters()):
-            # Check for NaN/Inf in source
-            if torch.isnan(model_p.data).any() or torch.isinf(model_p.data).any():
-                self.nan_count += 1
-                if self.nan_count <= 5:
-                    print(f"[EMA WARNING] Source param has NaN/Inf, skipping update (count={self.nan_count})")
-                return
-            
-            # EMA update: ema = decay * ema + (1 - decay) * model
-            # lerp_(end, weight) = self + weight * (end - self)
-            # With weight = (1-d): ema + (1-d)*(model - ema) = d*ema + (1-d)*model
-            ema_p.data.lerp_(model_p.data, weight=1.0 - d)
-        
-        # ================================================================
-        # PART 2: Update buffers (BatchNorm running_mean, running_var, etc.)
-        # ================================================================
-        ema_buffers = dict(self.module.named_buffers())
-        for name, model_buf in model.named_buffers():
-            if name in ema_buffers:
-                ema_buf = ema_buffers[name]
-                if ema_buf.is_floating_point():
-                    # Check for NaN/Inf
-                    if torch.isnan(model_buf).any() or torch.isinf(model_buf).any():
-                        continue  # Skip this buffer but continue with others
-                    # EMA update for floating point buffers
-                    ema_buf.lerp_(model_buf, weight=1.0 - d)
-                else:
-                    # Non-floating buffers (like num_batches_tracked): copy directly
-                    ema_buf.copy_(model_buf)
-        
+    def update(self, model):
+        """Update teacher with EMA. Call AFTER optimizer.step()."""
         self.step_count += 1
         
-        # Periodic verification
-        if self.step_count % 500 == 0:
-            valid = self._verify_weights()
-            if valid:
-                print(f"[EMA] Step {self.step_count} completed successfully")
-    
-    def _verify_weights(self):
-        """Check EMA model weights for NaN/Inf."""
-        for name, param in self.module.named_parameters():
-            if torch.isnan(param.data).any():
-                print(f"[EMA ERROR] EMA param '{name}' has NaN")
-                return False
-            if torch.isinf(param.data).any():
-                print(f"[EMA ERROR] EMA param '{name}' has Inf")
-                return False
-        for name, buf in self.module.named_buffers():
-            if buf.is_floating_point():
-                if torch.isnan(buf).any():
-                    print(f"[EMA ERROR] EMA buffer '{name}' has NaN")
-                    return False
-                if torch.isinf(buf).any():
-                    print(f"[EMA ERROR] EMA buffer '{name}' has Inf")
-                    return False
-        return True
+        if self.freeze_teacher:
+            self.updates += 1
+            return
+        
+        # Delay EMA updates to let student learn from GT first
+        if self.step_count < self.update_after_step:
+            if self.step_count % 100 == 0:
+                print(f"[EMA] Step {self.step_count}: waiting until step {self.update_after_step}")
+            return
+        
+        teacher_params = list(self.module.parameters())
+        student_params = list(model.parameters())
+        
+        # Check for NaN in student
+        for sp in student_params:
+            if torch.isnan(sp.data).any() or torch.isinf(sp.data).any():
+                self.nan_count += 1
+                if self.nan_count <= 5:
+                    print(f"[WeightEMA] Student has NaN/Inf, skipping")
+                return
+        
+        # EMA: θ = α*θ + (1-α)*θ_student
+        one_minus_alpha = 1.0 - self.alpha
+        for tp, sp in zip(teacher_params, student_params):
+            tp.data.mul_(self.alpha)
+            tp.data.add_(sp.data * one_minus_alpha)
+        
+        self.updates += 1
+        
+        if self.updates % 500 == 0:
+            print(f"[EMA] Update {self.updates}: α={self.alpha:.6f}")
     
     def forward(self, *args, **kwargs):
-        """Forward pass through EMA model (always in eval mode)."""
         return self.module(*args, **kwargs)
+
+
+class PairedMultiDomainDataset(torch.utils.data.Dataset):
+    """
+    Dataset loading 4 matched images: source_real, source_fake, target_real, target_fake.
     
-    # Backward compatibility aliases
-    def step(self):
-        """Deprecated: Use update(model) instead. This is a no-op for compatibility."""
-        print("[EMA WARNING] step() is deprecated. Use update(model) instead.")
-        pass
-            
-            
-# ============================================================================
-# DUAL DOMAIN DATASET - Load real + fake images
-# ============================================================================
+    Matching by filename ensures:
+    - Consistency Loss: source_real ↔ source_fake (same scene)
+    - Distillation: target_real ↔ target_fake (same scene)
+    """
+    
+    def __init__(self, source_real_path, source_fake_path, target_real_path, target_fake_path,
+                 imgsz=640, augment=False, hyp=None, data=None, stride=32):
+        from ultralytics.data.dataset import YOLODataset
+        from pathlib import Path
+        
+        self.imgsz = imgsz
+        self.augment = augment
+        
+        dataset_args = {
+            'imgsz': imgsz, 'augment': augment, 'cache': False,
+            'hyp': hyp, 'data': data, 'task': 'detect', 'stride': stride,
+            'rect': True, 'single_cls': False, 'pad': 0.5, 'classes': None,
+        }
+        
+        self.source_real_ds = YOLODataset(img_path=source_real_path, **dataset_args)
+        self.source_fake_ds = YOLODataset(img_path=source_fake_path, **dataset_args) if source_fake_path else None
+        self.target_real_ds = YOLODataset(img_path=target_real_path, **dataset_args) if target_real_path else None
+        self.target_fake_ds = YOLODataset(img_path=target_fake_path, **dataset_args) if target_fake_path else None
+        
+        # Build filename → index mappings
+        self.source_real_file_to_idx = self._build_file_index(self.source_real_ds)
+        self.source_fake_file_to_idx = self._build_file_index(self.source_fake_ds) if self.source_fake_ds else {}
+        self.target_real_file_to_idx = self._build_file_index(self.target_real_ds) if self.target_real_ds else {}
+        self.target_fake_file_to_idx = self._build_file_index(self.target_fake_ds) if self.target_fake_ds else {}
+        
+        self.n = len(self.source_real_ds)
+        self._log_matching_stats()
+    
+    def _build_file_index(self, dataset):
+        from pathlib import Path
+        if dataset is None:
+            return {}
+        return {Path(f).stem: i for i, f in enumerate(dataset.im_files)}
+    
+    def _log_matching_stats(self):
+        sr = set(self.source_real_file_to_idx.keys())
+        sf = set(self.source_fake_file_to_idx.keys())
+        tr = set(self.target_real_file_to_idx.keys())
+        tf = set(self.target_fake_file_to_idx.keys())
+        print(f"[PairedDataset] Source: {len(sr)} real, {len(sf)} fake, {len(sr & sf)} matched")
+        print(f"[PairedDataset] Target: {len(tr)} real, {len(tf)} fake, {len(tr & tf)} matched")
+    
+    def _get_matched_item(self, primary_ds, primary_idx, other_ds, other_idx_map):
+        if other_ds is None or not other_idx_map:
+            return primary_ds[primary_idx]
+        
+        from pathlib import Path
+        filename = Path(primary_ds.im_files[primary_idx]).stem
+        
+        if filename in other_idx_map:
+            return other_ds[other_idx_map[filename]]
+        return other_ds[primary_idx % len(other_ds)]
+    
+    def __len__(self):
+        return self.n
+    
+    def __getitem__(self, idx):
+        source_real = self.source_real_ds[idx]
+        source_fake = self._get_matched_item(self.source_real_ds, idx, self.source_fake_ds, self.source_fake_file_to_idx)
+        
+        target_idx = idx % len(self.target_real_ds) if self.target_real_ds else idx
+        target_real = self.target_real_ds[target_idx] if self.target_real_ds else source_real
+        target_fake = self._get_matched_item(
+            self.target_real_ds, target_idx, self.target_fake_ds, self.target_fake_file_to_idx
+        ) if self.target_real_ds else source_fake
+        
+        return {
+            'source_real': source_real, 'source_fake': source_fake,
+            'target_real': target_real, 'target_fake': target_fake,
+        }
+    
+    @staticmethod
+    def collate_fn(batch):
+        from ultralytics.data.dataset import YOLODataset
+        return {
+            'source_real': YOLODataset.collate_fn([b['source_real'] for b in batch]),
+            'source_fake': YOLODataset.collate_fn([b['source_fake'] for b in batch]),
+            'target_real': YOLODataset.collate_fn([b['target_real'] for b in batch]),
+            'target_fake': YOLODataset.collate_fn([b['target_fake'] for b in batch]),
+        }
+
+
 class DualDomainDataset(torch.utils.data.Dataset):
-    """
-    Dataset that loads paired real and fake (style-transferred) images.
-    """
+    """Dataset loading paired real and fake (style-transferred) images."""
+    
     def __init__(self, real_paths, fake_paths, imgsz=640, augment=True):
         from ultralytics.data.dataset import YOLODataset
         
-        # Build datasets for real and fake
-        self.real_dataset = YOLODataset(
-            img_path=real_paths,
-            imgsz=imgsz,
-            augment=augment,
-            cache=False,
-        )
-        
-        self.fake_dataset = YOLODataset(
-            img_path=fake_paths,
-            imgsz=imgsz,
-            augment=augment,
-            cache=False,
-        ) if fake_paths else None
-        
+        self.real_dataset = YOLODataset(img_path=real_paths, imgsz=imgsz, augment=augment, cache=False)
+        self.fake_dataset = YOLODataset(img_path=fake_paths, imgsz=imgsz, augment=augment, cache=False) if fake_paths else None
         self.n = len(self.real_dataset)
     
     def __len__(self):
         return self.n
     
     def __getitem__(self, idx):
-        # Get real image
         real_data = self.real_dataset[idx]
         
-        # Get corresponding fake image (or same if not available)
         if self.fake_dataset and len(self.fake_dataset) > 0:
-            fake_idx = idx % len(self.fake_dataset)
-            fake_data = self.fake_dataset[fake_idx]
+            fake_data = self.fake_dataset[idx % len(self.fake_dataset)]
         else:
             fake_data = real_data
         
@@ -192,117 +218,48 @@ class DualDomainDataset(torch.utils.data.Dataset):
             'bboxes': real_data.get('bboxes', torch.tensor([])),
             'batch_idx': real_data.get('batch_idx', torch.tensor([])),
         }
+
+
 def create_dual_dataloader(real_paths, fake_paths, imgsz, batch_size, workers=4, augment=True):
-    """Create dataloader for dual-domain (real + fake) images"""
+    """Create dataloader for dual-domain images."""
     from ultralytics.data import YOLODataset
     from ultralytics.data.build import InfiniteDataLoader
     
-    # Simple approach: use standard YOLO dataset for real images
-    dataset = YOLODataset(
-        img_path=real_paths,
-        imgsz=imgsz,
-        augment=augment,
-        cache=False,
-        batch_size=batch_size,
-    )
+    dataset = YOLODataset(img_path=real_paths, imgsz=imgsz, augment=augment, cache=False, batch_size=batch_size)
     
-    loader = InfiniteDataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=workers,
-        pin_memory=True,
-        collate_fn=YOLODataset.collate_fn,
-    )
-    
-    return loader, dataset
+    return InfiniteDataLoader(
+        dataset, batch_size=batch_size, shuffle=True,
+        num_workers=workers, pin_memory=True, collate_fn=YOLODataset.collate_fn,
+    ), dataset
 
 
-# ============================================================================
-# Combines Ultralytics loss with custom components
-# ============================================================================
 class FDALoss:
-    """
-    Combined loss for FDA training.
-    Uses Ultralytics v8DetectionLoss internally.
-    """
+    """Combined loss for FDA training using Ultralytics v8DetectionLoss."""
+    
     def __init__(self, model, class_mapping=None):
-        """
-        Args:
-            model: YOLOv8 detection model
-            class_mapping: Dict mapping class IDs to dataset class IDs.
-                          Must include BOTH:
-                          - COCO class IDs (for early training when Teacher still outputs COCO)
-                          - Dataset class IDs (for later training after Teacher adapts via EMA)
-                          Default: {0: 0, 1: 1, 2: 1, 5: 1, 7: 1}
-        """
         from ultralytics.utils import IterableSimpleNamespace
         
-        # Store class mapping for pseudo-label processing
-        # IMPORTANT: Include both COCO and dataset class IDs!
-        # - Early training: Teacher outputs COCO IDs (0, 2)
-        # - Later training: Teacher (via EMA) outputs dataset IDs (0, 1)
-        self.class_mapping = class_mapping or {
-            0: 0,   # person (both COCO and dataset)
-            1: 1,   # dataset car → car (for EMA-adapted Teacher)
-            2: 1,   # COCO car → car
-        }
+        # Class mapping: COCO ID → Dataset ID
+        self.class_mapping = class_mapping or {0: 0, 1: 1, 2: 1}
         
-        # Create complete hyp config with ALL required attributes
-        # Including loss weights that get_cfg() doesn't provide
         hyp = IterableSimpleNamespace(
-            # Loss weights (CRITICAL - these are required by v8DetectionLoss)
-            box=7.5,      # box loss gain
-            cls=0.5,      # cls loss gain
-            dfl=1.5,      # dfl loss gain
-            pose=12.0,    # pose loss gain
-            kobj=1.0,     # keypoint obj loss gain
-            # Other training hyperparameters
-            lr0=0.01,
-            lrf=0.01,
-            momentum=0.937,
-            weight_decay=0.0005,
-            warmup_epochs=3.0,
-            warmup_momentum=0.8,
-            warmup_bias_lr=0.1,
-            # Augmentation (needed for some operations)
-            hsv_h=0.015,
-            hsv_s=0.7,
-            hsv_v=0.4,
-            degrees=0.0,
-            translate=0.1,
-            scale=0.5,
-            shear=0.0,
-            perspective=0.0,
-            flipud=0.0,
-            fliplr=0.5,
-            mosaic=1.0,
-            mixup=0.0,
-            copy_paste=0.0,
-            # Other
-            label_smoothing=0.0,
-            nbs=64,
-            overlap_mask=True,
-            mask_ratio=4,
-            dropout=0.0,
+            box=7.5, cls=0.5, dfl=1.5, pose=12.0, kobj=1.0,
+            lr0=0.01, lrf=0.01, momentum=0.937, weight_decay=0.0005,
+            warmup_epochs=3.0, warmup_momentum=0.8, warmup_bias_lr=0.1,
+            hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
+            degrees=0.0, translate=0.1, scale=0.5, shear=0.0, perspective=0.0,
+            flipud=0.0, fliplr=0.5, mosaic=1.0, mixup=0.0, copy_paste=0.0,
+            label_smoothing=0.0, nbs=64, overlap_mask=True, mask_ratio=4, dropout=0.0,
         )
         
-        # Set model.args
         model.args = hyp
-        
         self.detection_loss = v8DetectionLoss(model)
-        
-        # Ensure hyp is IterableSimpleNamespace 
         self.detection_loss.hyp = hyp
-        
         self.device = next(model.parameters()).device
     
     def __call__(self, preds, batch):
-        """Compute detection loss using Ultralytics internals"""
         result = self.detection_loss(preds, batch)
         
-        # v8DetectionLoss returns (loss_sum, loss_items_tensor)
-        # loss_sum should be scalar, but ensure it
         if isinstance(result, tuple):
             loss = result[0]
             loss_items = result[1] if len(result) > 1 else None
@@ -310,71 +267,51 @@ class FDALoss:
             loss = result
             loss_items = None
         
-        # Ensure scalar
         if loss.numel() > 1:
             loss = loss.sum()
             
         return loss, loss_items
     
     def compute_distillation_loss(self, student_preds, pseudo_targets, img_shape):
-        """
-        Compute distillation loss using pseudo-labels.
-        
-        Args:
-            student_preds: Student model predictions
-            pseudo_targets: Pseudo-labels from teacher [x1,y1,x2,y2,conf,cls]
-            img_shape: (height, width) of input images
-        """
+        """Compute loss using pseudo-labels from teacher."""
         if pseudo_targets is None or len(pseudo_targets) == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        # Convert pseudo-labels to batch format for Ultralytics loss
         batch = self._format_pseudo_targets(pseudo_targets, img_shape)
         
         if batch['cls'].numel() == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        loss, loss_items = self.detection_loss(student_preds, batch)
+        loss, _ = self.detection_loss(student_preds, batch)
         return loss
     
     def _format_pseudo_targets(self, pseudo_labels_list, img_shape):
-        """Convert NMS output to Ultralytics batch format"""
+        """Convert NMS output to Ultralytics batch format."""
         img_h, img_w = img_shape
         
-        all_cls = []
-        all_bboxes = []
-        all_batch_idx = []
+        all_cls, all_bboxes, all_batch_idx = [], [], []
         
         for batch_idx, preds in enumerate(pseudo_labels_list):
             if preds is None or len(preds) == 0:
                 continue
             
-            # preds format: [x1, y1, x2, y2, conf, cls]
             boxes_xyxy = preds[:, :4]
             coco_classes = preds[:, 5]
             
-            # ============================================================
-            # COCO to Dataset class mapping (configurable via class_mapping)
-            # ============================================================
-            coco_to_dataset = self.class_mapping
-            
             # Filter and remap classes
             valid_mask = torch.zeros(len(preds), dtype=torch.bool, device=preds.device)
-            remapped_classes = torch.zeros_like(coco_classes)
+            remapped = torch.zeros_like(coco_classes)
             
-            for coco_cls, dataset_cls in coco_to_dataset.items():
+            for coco_cls, dataset_cls in self.class_mapping.items():
                 mask = coco_classes == coco_cls
                 valid_mask |= mask
-                remapped_classes[mask] = dataset_cls
+                remapped[mask] = dataset_cls
             
-            # Only keep valid predictions
             if valid_mask.sum() == 0:
                 continue
-                
-            boxes_xyxy = boxes_xyxy[valid_mask]
-            classes = remapped_classes[valid_mask]
             
-            # Convert to normalized xywh
+            boxes_xyxy = boxes_xyxy[valid_mask]
+            classes = remapped[valid_mask]
             boxes_xywhn = xyxy2xywhn(boxes_xyxy, w=img_w, h=img_h)
             
             all_cls.append(classes)
@@ -393,5 +330,3 @@ class FDALoss:
             'bboxes': torch.cat(all_bboxes),
             'batch_idx': torch.cat(all_batch_idx),
         }
-
-

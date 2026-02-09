@@ -1,96 +1,65 @@
-# ============================================================================
-# FusionDA Training Configuration
-# ============================================================================
-# All hyperparameters and settings for domain adaptive training.
-# Override via command line: python train.py --config train_config.yaml --epochs 200
-# ============================================================================
-
-# =========================
 # Model & Data
-# =========================
 model:
-  weights: "yolov8l.pt"           # Pretrained weights path
-  imgsz: 640                      # Input image size
+  weights: "yolov8l.pt"
+  imgsz: 640
 
 data:
-  config: "data.yaml"             # Dataset configuration file
-  workers: 8                      # Number of dataloader workers
-  batch_size: 4                   # Batch size per GPU
+  config: "data.yaml"
+  workers: 8
+  batch_size: 4
 
-# =========================
 # Training Schedule
-# =========================
 training:
-  epochs: 200                     # Total training epochs
-  warmup_epochs: 10               # Warmup period (no distillation loss weight)
-  
-  # Learning rate
-  lr0: 0.0001                     # Initial learning rate (reduced for stability with multiple losses)
-  lrf: 0.01                       # Final learning rate (lr0 * lrf)
-  
-  # Device
-  device: "0"                     # GPU device (0, 1, 2, ... or "cpu")
+  epochs: 100
+  warmup_epochs: 10               # Warmup period (no distillation loss)
+  lr0: 0.0001                     # Initial learning rate
+  lrf: 0.01                       # Final LR multiplier
+  device: "0"
 
-# =========================
-# Teacher-Student (EMA)
-# =========================
+# Mean Teacher EMA
+# Formula: θ_teacher = α * θ_teacher + (1-α) * θ_student
+# Only PARAMETERS updated, BUFFERS (BatchNorm) stay frozen
+# Teacher always in eval mode, update called AFTER optimizer.step()
 teacher:
-  alpha: 0.999                    # EMA decay rate (higher = slower update)
-  ema_warmup_epochs: 1           # Delay EMA updates until this epoch (student needs to learn first)
-  
-# =========================
-# Pseudo-Label & Distillation
-# =========================
+  freeze_teacher: false           # If true, no EMA updates
+  alpha: 0.999                    # Higher = slower adaptation
+
+# Distillation (Teacher → Student knowledge transfer)
 distillation:
-  # Confidence thresholds (curriculum learning: low -> high)
-  conf_thres_min: 0.15            # Min confidence at start
-  conf_thres_max: 0.50            # Max confidence at end
-  iou_thres: 0.45                 # IoU threshold for NMS
-  
-  # Loss weight
+  conf_thres_min: 0.5             # Curriculum: start low
+  conf_thres_max: 0.7             # Curriculum: end high
+  iou_thres: 0.45
   lambda_weight: 0.1              # Distillation loss weight
-  use_progressive_lambda: true    # Increase lambda over epochs
-  
-  # Class mapping: Input class ID -> Dataset class ID
-  # COCO: 0=person, 2=car
-  # Dataset: 0=person, 1=car
-  # IMPORTANT: Include BOTH to handle:
-  #   - Early training: teacher outputs COCO IDs (0, 2)
-  #   - After EMA: teacher outputs Dataset IDs (0, 1)
+  use_progressive_lambda: true
+  # Class mapping: COCO ID → Dataset ID
   class_mapping:
-    0: 0    # person (COCO and Dataset)
-    1: 1    # car (Dataset, after EMA adaptation)
-    2: 1    # car (COCO, early training)
+    0: 0    # person
+    2: 1    # car
 
-# =========================
 # Domain Adversarial (GRL)
-# =========================
+# Gradient Reversal Layer aligns source/target feature distributions
 grl:
-  enabled: true                   # Enable Gradient Reversal Layer
-  warmup_epochs: 10               # Warmup before GRL activates
-  max_alpha: 0.3                  # Maximum GRL alpha value (reduced for stability)
-  weight: 0.05                    # Domain loss weight
-  hidden_dim: 256                 # Discriminator hidden dimension
-  dropout: 0.3                    # Discriminator dropout rate
-  lr: 0.0001                      # GRL optimizer learning rate
+  enabled: true
+  warmup_epochs: 10
+  max_alpha: 0.3
+  weight: 0.05
+  hidden_dim: 256
+  dropout: 0.3
+  lr: 0.0001
 
-# =========================
-# Output & Logging
-# =========================
+# Output
 output:
-  project: "runs/fda"             # Output project directory
-  name: "exp"                     # Experiment name
-  
-logging:
-  log_interval: 100               # Log every N iterations
-  val_interval: 10                # Validate every N epochs
-  save_interval: 10               # Save checkpoint every N epochs
-  enable_monitoring: true         # Enable domain distribution monitoring
+  project: "runs/fda"
+  name: "exp"
 
-# =========================
-# Memory & Performance
-# =========================
+logging:
+  log_interval: 100
+  val_interval: 10
+  save_interval: 10
+  enable_monitoring: true
+
+# Performance
 performance:
-  amp: true                       # Use Automatic Mixed Precision
-  cache_clear_interval: 200       # Clear CUDA cache every N iterations
-  gradient_clip: 2.0              # Gradient clipping max norm (reduced for stability)
+  amp: true
+  cache_clear_interval: 200
+  gradient_clip: 2.0

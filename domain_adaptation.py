@@ -1,14 +1,13 @@
+"""Domain Adaptation components: GRL and Domain Discriminator."""
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ============================================================================
-# GRADIENT REVERSAL LAYER
-# ============================================================================
+
 class GradientReversalFunction(torch.autograd.Function):
     """
-    Gradient Reversal Layer - Core của Domain Adversarial Training.
+    Gradient Reversal Layer.
     Forward: identity
     Backward: gradient * (-alpha)
     """
@@ -16,36 +15,33 @@ class GradientReversalFunction(torch.autograd.Function):
     def forward(ctx, x, alpha):
         ctx.alpha = alpha
         return x.view_as(x)
+    
     @staticmethod
     def backward(ctx, grad_output):
-        output = grad_output.neg() * ctx.alpha
-        return output, None
-    
+        return grad_output.neg() * ctx.alpha, None
+
+
 class GradientReversalLayer(nn.Module):
-    """Wrapper cho Gradient Reversal Function"""
+    """Wrapper for GradientReversalFunction."""
     def __init__(self, alpha=1.0):
         super().__init__()
         self.alpha = alpha
+    
     def forward(self, x):
         return GradientReversalFunction.apply(x, self.alpha)
-    
-# ============================================================================
-# DOMAIN DISCRIMINATOR
-# ============================================================================
+
+
 class DomainDiscriminator(nn.Module):
     """
-    Domain Discriminator cho YOLOv8.
-    Nhận features từ backbone và phân loại source/target domain.
-    
-    GRL được tích hợp bên trong - gradient tự động đảo ngược về backbone.
+    Domain Discriminator for YOLOv8.
+    Classifies backbone features as source (1) or target (0).
+    GRL is integrated - gradients automatically reversed to backbone.
     """
     def __init__(self, in_channels=512, hidden_dim=256, dropout=0.3):
         super().__init__()
         
-        # GRL tích hợp
         self.grl = GradientReversalLayer(alpha=1.0)
         
-        # Lightweight discriminator
         self.discriminator = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -61,7 +57,6 @@ class DomainDiscriminator(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights with small values for stable training"""
         for m in self.discriminator.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight, gain=0.1)
@@ -69,108 +64,60 @@ class DomainDiscriminator(nn.Module):
                     nn.init.constant_(m.bias, 0)
     
     def forward(self, x, alpha=None):
-        """
-        Args:
-            x: Feature maps từ backbone [B, C, H, W]
-            alpha: GRL alpha value (optional)
-        
-        Returns:
-            domain_pred: [B, 1] logits (source=1, target=0)
-        """
-        # Safety check for NaN/Inf inputs - prevents gradient explosion
+        # Safety check for NaN/Inf
         if torch.isnan(x).any() or torch.isinf(x).any():
             return torch.zeros(x.size(0), 1, device=x.device, requires_grad=True)
         
         if alpha is not None:
             self.grl.alpha = alpha
         
-        x = self.grl(x)
-        return self.discriminator(x)
-# ============================================================================
-# YOLOV8 FEATURE HOOK
-# ============================================================================
+        return self.discriminator(self.grl(x))
+
+
 class YOLOv8FeatureHook:
     """
-    Hook để extract features từ YOLOv8 backbone.
+    Hook to extract features from YOLOv8 backbone.
     
-    QUAN TRỌNG: Mỗi instance chỉ lưu 1 feature map tại 1 thời điểm.
-    Để lấy source và target features, cần forward 2 lần riêng biệt.
-    
-    Usage:
-        # For DetectionModel directly
-        hook = YOLOv8FeatureHook(model, layer_idx=9)
-        
-        # Forward source
-        _ = model(source_imgs)
-        source_features = hook.get_features()
-        
-        # Forward target  
-        _ = model(target_imgs)
-        target_features = hook.get_features()
-    
-    Layer indices for YOLOv8:
-        - Layer 4: C2f (P3 features) 
-        - Layer 6: C2f (P4 features)
-        - Layer 9: SPPF (backbone output) <- Default
+    Layer indices:
+    - 4: C2f (P3)
+    - 6: C2f (P4)  
+    - 9: SPPF (backbone output) <- Default
     """
     
     def __init__(self, model, layer_idx=9):
-        """
-        Args:
-            model: YOLOv8 DetectionModel OR YOLO wrapper
-            layer_idx: Index của layer cần hook (9 = backbone output)
-        """
         self.features = None
         self._hook_handle = None
         self.layer_idx = layer_idx
-        
         self._register_hook(model)
     
     def _register_hook(self, model):
-        """Đăng ký hook vào layer"""
         try:
             # Handle different model wrapper patterns
-            # Pattern 1: Direct DetectionModel
             if hasattr(model, 'model') and isinstance(model.model, nn.Sequential):
-                target_layer = model.model[self.layer_idx]
-            # Pattern 2: DetectionModel without Sequential wrapper
+                target = model.model[self.layer_idx]
             elif hasattr(model, 'model') and hasattr(model.model, 'model'):
-                target_layer = model.model.model[self.layer_idx]
-            # Pattern 3: nn.Sequential directly  
+                target = model.model.model[self.layer_idx]
             elif isinstance(model, nn.Sequential):
-                target_layer = model[self.layer_idx]
+                target = model[self.layer_idx]
             else:
-                # Fallback: try direct access
-                target_layer = model.model[self.layer_idx]
+                target = model.model[self.layer_idx]
             
-            self._hook_handle = target_layer.register_forward_hook(self._hook_fn)
-            print(f"[GRL] Registered hook at layer {self.layer_idx}: {target_layer.__class__.__name__}")
+            self._hook_handle = target.register_forward_hook(self._hook_fn)
+            print(f"[GRL] Hook at layer {self.layer_idx}: {target.__class__.__name__}")
             
         except Exception as e:
-            print(f"[GRL Warning] Cannot register hook at layer {self.layer_idx}: {e}")
-            print(f"[GRL] Model type: {type(model)}")
-            if hasattr(model, 'model'):
-                print(f"[GRL] model.model type: {type(model.model)}")
+            print(f"[GRL] Cannot register hook: {e}")
             self._hook_handle = None
     
     def _hook_fn(self, module, input, output):
-        """Hook function - LƯU FEATURES VỚI GRADIENT"""
-        # QUAN TRỌNG: Không .detach() để giữ gradient flow
-        self.features = output
+        self.features = output  # Keep gradient flow
     
     def get_features(self):
-        """
-        Lấy features và clear buffer.
-        
-        Returns:
-            features: [B, C, H, W] tensor với gradient
-        """
         features = self.features
-        self.features = None  # Clear để tránh memory leak
+        self.features = None
         return features
     
     def remove(self):
-        """Xóa hook khi không cần nữa"""
         if self._hook_handle is not None:
             self._hook_handle.remove()
             self._hook_handle = None
@@ -178,107 +125,52 @@ class YOLOv8FeatureHook:
     def __del__(self):
         try:
             self.remove()
-        except AttributeError:
-            pass  # Object was not fully initialized
+        except:
+            pass
 
 
 def get_grl_alpha(epoch, total_epochs, warmup_epochs=10, max_alpha=1.0):
     """
-    Tính alpha cho GRL theo epoch (progressive training).
-    Sử dụng quadratic schedule để tránh gradient explosion.
-    
-    Args:
-        epoch: Current epoch
-        total_epochs: Total training epochs  
-        warmup_epochs: Warmup period (alpha = 0)
-        max_alpha: Maximum alpha value
-    
-    Returns:
-        alpha: GRL multiplier (float)
+    Progressive GRL alpha using quadratic schedule.
+    Returns 0 during warmup, then increases to max_alpha.
     """
     if epoch < warmup_epochs:
         return 0.0
     
-    # Progressive increase from 0 to max_alpha
-    progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
-    progress = min(progress, 1.0)
-    
-    # Quadratic schedule - smoother and more stable than sigmoid
-    # Prevents sudden alpha jumps that cause gradient explosion
-    # Recommend max_alpha <= 0.3 for stability with YOLOv8
-    alpha = max_alpha * (progress ** 2)
-    
-    return alpha
+    progress = min((epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1), 1.0)
+    return max_alpha * (progress ** 2)
+
+
 def compute_domain_loss(domain_pred_source, domain_pred_target):
-    """
-    Tính Domain Adversarial Loss với safety checks.
-    
-    Args:
-        domain_pred_source: Predictions cho source domain [B, 1]
-        domain_pred_target: Predictions cho target domain [B, 1]
-    
-    Returns:
-        domain_loss: Binary cross entropy loss (scalar)
-    """
-    # Safety check for NaN/Inf
+    """Domain adversarial loss: BCE for classifying source=1, target=0."""
+    # Safety check
     if (torch.isnan(domain_pred_source).any() or torch.isnan(domain_pred_target).any() or
         torch.isinf(domain_pred_source).any() or torch.isinf(domain_pred_target).any()):
         return torch.tensor(0.0, device=domain_pred_source.device, requires_grad=True)
     
-    # Clamp predictions to prevent extreme gradients
+    # Clamp to prevent extreme gradients
     domain_pred_source = torch.clamp(domain_pred_source, -10, 10)
     domain_pred_target = torch.clamp(domain_pred_target, -10, 10)
     
-    batch_size_source = domain_pred_source.size(0)
-    batch_size_target = domain_pred_target.size(0)
+    source_labels = torch.ones(domain_pred_source.size(0), 1, device=domain_pred_source.device)
+    target_labels = torch.zeros(domain_pred_target.size(0), 1, device=domain_pred_target.device)
     
-    # Labels: 1 for source, 0 for target
-    source_labels = torch.ones(batch_size_source, 1, device=domain_pred_source.device)
-    target_labels = torch.zeros(batch_size_target, 1, device=domain_pred_target.device)
+    loss_source = F.binary_cross_entropy_with_logits(domain_pred_source, source_labels)
+    loss_target = F.binary_cross_entropy_with_logits(domain_pred_target, target_labels)
     
-    # Binary cross entropy with logits
-    loss_source = F.binary_cross_entropy_with_logits(
-        domain_pred_source, source_labels, reduction='mean'
-    )
-    loss_target = F.binary_cross_entropy_with_logits(
-        domain_pred_target, target_labels, reduction='mean'
-    )
-    
-    domain_loss = (loss_source + loss_target) / 2
-    
-    return domain_loss
+    return (loss_source + loss_target) / 2
+
+
 def get_domain_accuracy(domain_pred_source, domain_pred_target):
-    """
-    Tính accuracy của domain discriminator (để monitoring).
-    
-    Args:
-        domain_pred_source: Predictions cho source domain [B, 1]
-        domain_pred_target: Predictions cho target domain [B, 1]
-    
-    Returns:
-        accuracy: float [0, 1]
-    """
+    """Calculate domain discriminator accuracy for monitoring."""
     with torch.no_grad():
-        # Source: predict > 0 là đúng (label = 1)
         source_correct = (domain_pred_source > 0).float().sum()
-        # Target: predict <= 0 là đúng (label = 0)
         target_correct = (domain_pred_target <= 0).float().sum()
-        
         total = domain_pred_source.size(0) + domain_pred_target.size(0)
-        accuracy = (source_correct + target_correct) / total
-        
-    return accuracy.item()
+        return ((source_correct + target_correct) / total).item()
+
 
 def create_feature_hook(model, layer_name='backbone'):
-    """
-    Tạo feature hook cho YOLOv8 model.
-    
-    Args:
-        model: YOLOv8 model
-        layer_name: 'backbone' (layer 9) hoặc 'neck' (layer 12)
-    
-    Returns:
-        YOLOv8FeatureHook instance
-    """
+    """Create feature hook for YOLOv8."""
     layer_idx = 9 if layer_name == 'backbone' else 12
     return YOLOv8FeatureHook(model, layer_idx=layer_idx)
