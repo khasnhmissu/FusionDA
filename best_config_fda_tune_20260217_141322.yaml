@@ -1,0 +1,45 @@
+data:
+  batch_size: 4
+  config: data.yaml
+  workers: 8
+distillation:
+  class_mapping:
+    0: 0
+    2: 1
+  conf_thres_max: 0.8909729556485984
+  conf_thres_min: 0.3061753482887407
+  iou_thres: 0.45
+  lambda_weight: 0.33994812107955635
+  use_progressive_lambda: true
+grl:
+  dropout: 0.3
+  enabled: true
+  hidden_dim: 256
+  lr: 0.00015930522616241006
+  max_alpha: 0.3832290311184182
+  warmup_epochs: 10
+  weight: 0.13394334706750485
+logging:
+  enable_monitoring: true
+  log_interval: 100
+  save_interval: 10
+  val_interval: 10
+model:
+  imgsz: 640
+  weights: yolov8l.pt
+output:
+  name: exp
+  project: runs/fda
+performance:
+  amp: true
+  cache_clear_interval: 200
+  gradient_clip: 2.0
+teacher:
+  alpha: 0.9920939272525521
+  freeze_teacher: false
+training:
+  device: '0'
+  epochs: 200
+  lr0: 0.0001
+  lrf: 0.01
+  warmup_epochs: 10

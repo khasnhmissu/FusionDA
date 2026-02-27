@@ -186,32 +186,36 @@ def config_to_namespace(config: FDAConfig) -> Namespace:
     ns.amp = config.performance.amp
     ns.cache_clear_interval = config.performance.cache_clear_interval
     ns.gradient_clip = config.performance.gradient_clip
+    ns.gradient_clip_value = config.performance.gradient_clip
     
     return ns
 
 
 def merge_cli_args(config: FDAConfig, args: Namespace) -> FDAConfig:
-    """Merge CLI arguments into config. CLI takes precedence."""
+    """Merge CLI arguments into config. Only explicitly-provided CLI args take precedence."""
+    import sys
+    
     cli_mapping = {
-        'weights': ('model', 'weights'),
-        'imgsz': ('model', 'imgsz'),
-        'data': ('data', 'config'),
-        'workers': ('data', 'workers'),
-        'batch': ('data', 'batch_size'),
-        'epochs': ('training', 'epochs'),
-        'device': ('training', 'device'),
-        'lr0': ('training', 'lr0'),
-        'use_grl': ('grl', 'enabled'),
-        'name': ('output', 'name'),
-        'project': ('output', 'project'),
-        'enable_monitoring': ('logging', 'enable_monitoring'),
-        'teacher_alpha': ('teacher', 'alpha'),
-        'freeze_teacher': ('teacher', 'freeze_teacher'),
+        'weights': ('model', 'weights', '--weights'),
+        'imgsz': ('model', 'imgsz', '--imgsz'),
+        'data': ('data', 'config', '--data'),
+        'workers': ('data', 'workers', '--workers'),
+        'batch': ('data', 'batch_size', '--batch'),
+        'epochs': ('training', 'epochs', '--epochs'),
+        'device': ('training', 'device', '--device'),
+        'lr0': ('training', 'lr0', '--lr0'),
+        'use_grl': ('grl', 'enabled', '--use-grl'),
+        'name': ('output', 'name', '--name'),
+        'project': ('output', 'project', '--project'),
+        'enable_monitoring': ('logging', 'enable_monitoring', '--enable-monitoring'),
+        'teacher_alpha': ('teacher', 'alpha', '--teacher-alpha'),
+        'freeze_teacher': ('teacher', 'freeze_teacher', '--freeze-teacher'),
     }
     
-    for arg_name, (section, attr) in cli_mapping.items():
-        if hasattr(args, arg_name):
-            arg_value = getattr(args, arg_name)
+    for arg_name, (section, attr, cli_flag) in cli_mapping.items():
+        # Only override config if user explicitly provided this flag on CLI
+        if cli_flag in sys.argv:
+            arg_value = getattr(args, arg_name, None)
             if arg_value is not None:
                 section_obj = getattr(config, section)
                 if hasattr(section_obj, attr):

@@ -22,7 +22,7 @@ training:
 # Teacher always in eval mode, update called AFTER optimizer.step()
 teacher:
   freeze_teacher: false           # If true, no EMA updates
-  alpha: 0.999                    # Higher = slower adaptation
+  alpha: 0.9999                    # Higher = slower adaptation
 
 # Distillation (Teacher → Student knowledge transfer)
 distillation:

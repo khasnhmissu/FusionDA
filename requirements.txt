@@ -19,3 +19,7 @@ seaborn>=0.12.0
 scikit-learn>=1.1.0   
 umap-learn>=0.5.3         
 ensemble-boxes>=1.0.9
+
+# Hyperparameter tuning
+optuna>=3.0.0
+plotly>=5.10.0

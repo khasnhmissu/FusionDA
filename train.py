@@ -83,7 +83,7 @@ def train(opt):
     (save_dir / 'weights').mkdir(exist_ok=True)
     
     # Load data config
-    with open(opt.data) as f:
+    with open(opt.data, encoding='utf-8') as f:
         data_dict = yaml.safe_load(f)
     
     nc = data_dict['nc']
@@ -129,10 +129,10 @@ def train(opt):
         domain_discriminator = DomainDiscriminator(
             in_channels=in_channels,
             hidden_dim=opt.grl_hidden_dim,
-            dropout=0.3
+            dropout=getattr(opt, 'grl_dropout', 0.3)
         ).to(device)
         
-        grl_optimizer = optim.Adam(domain_discriminator.parameters(), lr=1e-4)
+        grl_optimizer = optim.Adam(domain_discriminator.parameters(), lr=getattr(opt, 'grl_lr', 1e-4))
         LOGGER.info(f'{colorstr("GRL:")} in_channels={in_channels}')
     
     # Optimizer & Scheduler
@@ -203,11 +203,12 @@ def train(opt):
         LOGGER.info(colorstr('AMP: ') + 'Disabled')
     
     # Logger
+    tuning_mode = getattr(opt, 'tuning_mode', False)
     logger = TrainingLogger(
         save_dir=str(save_dir),
         project_name='FusionDA',
-        use_tensorboard=True,
-        verbose=True,
+        use_tensorboard=not tuning_mode,  # Disable TB during tuning
+        verbose=not tuning_mode,
     )
     logger.log_config({
         'weights': opt.weights, 'data': opt.data, 'epochs': opt.epochs,
@@ -401,8 +402,9 @@ def train(opt):
                     
                     n_pseudo = sum(len(p) if p is not None else 0 for p in pseudo_labels)
                     
-                    # Debug images
-                    if i % 100 == 0:
+                    # Debug images (skip in tuning mode to save disk)
+                    tuning_mode = getattr(opt, 'tuning_mode', False)
+                    if not tuning_mode and i % 100 == 0:
                         debug_dir = save_dir / 'debug_images'
                         debug_dir.mkdir(exist_ok=True)
                         n_boxes = save_debug_image(
@@ -458,9 +460,10 @@ def train(opt):
             if grl_optimizer_active:
                 scaler.unscale_(grl_optimizer)
             
-            torch.nn.utils.clip_grad_norm_(model_student.parameters(), max_norm=2.0)
+            grad_clip = getattr(opt, 'gradient_clip', 2.0)
+            torch.nn.utils.clip_grad_norm_(model_student.parameters(), max_norm=grad_clip)
             if opt.use_grl and domain_discriminator:
-                torch.nn.utils.clip_grad_norm_(domain_discriminator.parameters(), max_norm=2.0)
+                torch.nn.utils.clip_grad_norm_(domain_discriminator.parameters(), max_norm=grad_clip)
             
             # Check for NaN gradients
             grad_nan = False
@@ -582,13 +585,14 @@ def train(opt):
                 gc.collect()
                 torch.cuda.empty_cache()
         
-        # Save last
-        torch.save({
-            'epoch': epoch,
-            'model': model_student.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'best_fitness': best_fitness,
-        }, save_dir / 'weights' / 'last.pt')
+        # Save last (skip in tuning mode to save disk)
+        if not getattr(opt, 'tuning_mode', False):
+            torch.save({
+                'epoch': epoch,
+                'model': model_student.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_fitness': best_fitness,
+            }, save_dir / 'weights' / 'last.pt')
     
     # Cleanup
     if feature_hook:
