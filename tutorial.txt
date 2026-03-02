@@ -70,9 +70,118 @@ datasets/
             └── labels/
 ```
 
-### Train
+## ========================================
+## A. BASELINE TRAINING (Supervised cơ bản)
+## ========================================
+
+### Files cần đẩy lên server
+```
+FusionDA/
+├── train_baseline.py        ← script train baseline
+├── data.yaml                ← config multi-domain (source + target)
+├── data_clear.yaml          ← config source only
+├── data_foggy.yaml          ← config target only
+├── requirements.txt         ← dependencies
+└── setup_server.sh          ← auto setup script
+```
+
+### Upload lên server
 ```bash
-# Basic
+# Cách 1: Upload toàn bộ project
+scp -r FusionDA user@server:~/
+
+# Cách 2: Chỉ upload files cần thiết cho baseline
+scp train_baseline.py data.yaml data_clear.yaml data_foggy.yaml \
+    requirements.txt setup_server.sh user@server:~/FusionDA/
+```
+
+### Setup trên server
+```bash
+ssh user@server
+cd ~/FusionDA
+
+# Cài đặt dependencies
+pip install ultralytics pyyaml tqdm
+
+# Download datasets (nếu chưa có)
+pip install gdown
+mkdir -p datasets && cd datasets
+gdown 1p_pJjOIngZ6ylbPSs2fD3Eo7QR8q5C2b -O source_real.zip
+mkdir source_real && unzip -q source_real.zip -d source_real && rm source_real.zip
+gdown 1Y8GA79Hng9MD6llcSi3ys4NgWouxTnZb -O target_real.zip
+mkdir target_real && unzip -q target_real.zip -d target_real && rm target_real.zip
+cd ..
+```
+
+### Chạy Baseline Training
+```bash
+# Train cả source (clear) + target (foggy) — Baseline chính
+python train_baseline.py --data data.yaml --weights yolov8n.pt --epochs 100 --batch 16 --name baseline_combined
+
+# Chỉ train trên source (clear)
+python train_baseline.py --data data_clear.yaml --weights yolov8n.pt --epochs 100 --name baseline_source_only
+
+# Chỉ train trên target (foggy)
+python train_baseline.py --data data_foggy.yaml --weights yolov8n.pt --epochs 100 --name baseline_target_only
+
+# Bật AMP để tăng tốc
+python train_baseline.py --data data.yaml --weights yolov8n.pt --epochs 100 --batch 16 --amp --name baseline_amp
+```
+
+### Baseline Key Arguments
+| Arg | Default | Description |
+|-----|---------|-------------|
+| --data | data.yaml | File YAML config dataset |
+| --weights | yolov8n.pt | Pretrained weights |
+| --epochs | 100 | Số epoch train |
+| --batch | 16 | Batch size |
+| --lr0 | 0.01 | Learning rate ban đầu |
+| --val-interval | 5 | Validate mỗi N epoch |
+| --amp | off | Mixed precision training |
+
+### Baseline Outputs
+```
+runs/baseline/exp/
+├── weights/best.pt      ← model tốt nhất (theo mAP@50)
+└── weights/last.pt      ← model epoch cuối
+```
+
+## ========================================
+## B. FDA TRAINING (Domain Adaptation)
+## ========================================
+
+### Files cần thêm cho FDA (ngoài files baseline)
+```
+FusionDA/
+├── train.py                 ← script train FDA
+├── domain_adaptation.py     ← GRL, discriminator
+├── fusion_da.py             ← FDALoss, WeightEMA, PairedDataset
+├── utils/
+│   ├── FDA_helpers.py
+│   ├── training_logger.py
+│   └── domain_monitor.py
+└── data.yaml                ← cần cả 4 domain paths
+```
+
+### Upload thêm cho FDA
+```bash
+scp train.py domain_adaptation.py fusion_da.py user@server:~/FusionDA/
+scp -r utils user@server:~/FusionDA/
+```
+
+### Download thêm datasets (source_fake + target_fake)
+```bash
+cd ~/FusionDA/datasets
+gdown 1Mh2dm0lzBk8gi7R8zTj0e2V9tXus8Tmb -O source_fake.zip
+mkdir source_fake && unzip -q source_fake.zip -d source_fake && rm source_fake.zip
+gdown 15xPIUiQ7Io2W8xrPBQYcwPoFiwsNKddW -O target_fake.zip
+mkdir target_fake && unzip -q target_fake.zip -d target_fake && rm target_fake.zip
+cd ..
+```
+
+### Chạy FDA Training
+```bash
+# Basic FDA
 python train.py --data data.yaml --weights yolov8n.pt --epochs 200 --batch 16
 
 # With GRL domain adaptation
@@ -82,7 +191,7 @@ python train.py --data data.yaml --weights yolov8n.pt --epochs 200 --batch 16 --
 python train.py --data data.yaml --weights yolov8n.pt --epochs 200 --batch 16 --use-grl --enable-monitoring
 ```
 
-## Key Arguments
+### FDA Key Arguments
 | Arg | Default | Description |
 |-----|---------|-------------|
 | --epochs | 200 | Training epochs |
@@ -90,7 +199,7 @@ python train.py --data data.yaml --weights yolov8n.pt --epochs 200 --batch 16 --
 | --use-grl | off | Enable domain adaptation |
 | --enable-monitoring | off | Enable explainability |
 
-## Outputs
+### FDA Outputs
 ```
 runs/fda/exp/
 ├── weights/best.pt
