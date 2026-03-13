@@ -207,3 +207,11 @@ runs/fda/exp/
 ├── epoch_metrics.csv
 └── explainability/  (if monitoring enabled)
 ```
+
+gdown 1TRnmVqgujZucqvwLDCvKA55z_j3usUtm -O target_test.zip
+gdown 1zK5SqDdXekeFMYNtONSOcavMW2vfhJBq -O source_test.zip
+unzip -q source_test.zip -d source_test
+unzip -q target_test.zip -d target_test
+
+gdown 1ABjEXJrJoLybtBrv7AlXIyYqBnwaDgT4 -O results.zip
+unzip -q results.zip -d results

@@ -163,7 +163,7 @@ def load_model(weights, checkpoint, device, half=False):
     model = yolo.model.to(device)
 
     # Load FusionDA state_dict
-    ckpt = torch.load(checkpoint, map_location=device)
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
 
     if isinstance(ckpt, dict) and 'model' in ckpt:
         state_dict = ckpt['model']
