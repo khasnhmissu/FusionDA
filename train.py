@@ -105,7 +105,8 @@ def train(opt):
         alpha=opt.teacher_alpha,
         freeze_teacher=getattr(opt, 'freeze_teacher', False),
         device=device,
-        update_after_step=700
+        update_after_step=getattr(opt, 'update_after_step', 2000),
+        alpha_rampup_steps=getattr(opt, 'alpha_rampup_steps', 5000),
     )
     model_teacher = teacher_ema.module
     
@@ -116,9 +117,18 @@ def train(opt):
     domain_discriminator = None
     feature_hook = None
     grl_optimizer = None
+    monitor_hook = None  # Dedicated hook for monitoring (works without GRL)
+    
+    # Always create a monitoring hook for feature collection (UMAP/MMD)
+    if opt.enable_monitoring:
+        monitor_hook = YOLOv8FeatureHook(model_student, layer_idx=9)
+        LOGGER.info(f'{colorstr("Monitor:")} Feature hook for UMAP/MMD')
     
     if opt.use_grl:
-        feature_hook = YOLOv8FeatureHook(model_student, layer_idx=9)
+        if monitor_hook:
+            feature_hook = monitor_hook  # Reuse monitoring hook for GRL
+        else:
+            feature_hook = YOLOv8FeatureHook(model_student, layer_idx=9)
         
         with torch.no_grad():
             test_img = torch.zeros(1, 3, opt.imgsz, opt.imgsz, device=device)
@@ -134,6 +144,11 @@ def train(opt):
         
         grl_optimizer = optim.Adam(domain_discriminator.parameters(), lr=getattr(opt, 'grl_lr', 1e-4))
         LOGGER.info(f'{colorstr("GRL:")} in_channels={in_channels}')
+    
+    # Checkpoint epochs for pseudo-label quality analysis
+    checkpoint_epochs = set(getattr(opt, 'checkpoint_epochs', [0, 50, 100, 150]))
+    checkpoint_epochs.add(opt.epochs - 1)  # Always save final
+    LOGGER.info(f'Saving intermediate checkpoints at epochs: {sorted(checkpoint_epochs)}')
     
     # Optimizer & Scheduler
     optimizer = optim.AdamW(model_student.parameters(), lr=opt.lr0, weight_decay=0.0005)
@@ -243,6 +258,8 @@ def train(opt):
     best_fitness = 0.0
     t0 = time.time()
     global_step = 0
+    burn_in_epochs = getattr(opt, 'burn_in_epochs', 10)
+    source_loss_baseline = None  # Track source loss baseline for teacher validation
     
     for epoch in range(opt.epochs):
         model_student.train()
@@ -289,13 +306,18 @@ def train(opt):
                 source_features = None
                 if feature_hook:
                     source_features = feature_hook.get_features()
+                elif monitor_hook:
+                    source_features = monitor_hook.get_features()
                 
                 # Source-fake forward
                 pred_source_fake = model_student(imgs_source_fake)
                 loss_source_fake, _ = compute_loss(pred_source_fake, batch_source)
                 
-                if opt.use_grl and feature_hook:
-                    _ = feature_hook.get_features()
+                source_fake_features = None
+                if feature_hook:
+                    source_fake_features = feature_hook.get_features()
+                elif monitor_hook:
+                    source_fake_features = monitor_hook.get_features()
                 
                 # Target forward
                 pred_target = model_student(imgs_target)
@@ -303,6 +325,8 @@ def train(opt):
                 target_features = None
                 if feature_hook:
                     target_features = feature_hook.get_features()
+                elif monitor_hook:
+                    target_features = monitor_hook.get_features()
                 
                 # Domain loss (GRL)
                 loss_domain = torch.tensor(0.0, device=device, requires_grad=False)
@@ -320,101 +344,144 @@ def train(opt):
                                 domain_pred_source, domain_pred_target, epoch, i
                             )
                 
-                # Pseudo-labels from teacher
-                with torch.no_grad():
-                    pred_teacher = model_teacher(imgs_target_fake)
+                # ── Burn-in check: no pseudo labels during early epochs ──
+                img_h, img_w = imgs_target.shape[2:]
+                
+                if epoch < burn_in_epochs:
+                    # During burn-in: student learns ONLY from GT (source)
+                    # No pseudo labels to prevent confirmation bias
+                    pseudo_labels = [torch.zeros(0, 6, device=device)
+                                     for _ in range(imgs_target.shape[0])]
+                    n_pseudo = 0
+                    adaptive_conf = 1.0  # For logging
                     
-                    if isinstance(pred_teacher, dict):
-                        pred_tensor = pred_teacher.get('one2one', pred_teacher.get('one2many', None))
-                        if pred_tensor is not None:
-                            pred_tensor = pred_tensor[0] if isinstance(pred_tensor, (list, tuple)) else pred_tensor
+                    if i == 0 and epoch == 0:
+                        LOGGER.info(f'[BURN-IN] No pseudo labels for first {burn_in_epochs} epochs')
+                else:
+                    # ── Self-validation gating (every 5 epochs, first batch) ──
+                    # Check if teacher still produces reasonable output on source
+                    if epoch % 5 == 0 and i == 0:
+                        with torch.no_grad():
+                            teacher_pred_source = model_teacher(imgs_source)
+                            teacher_source_loss, _ = compute_loss(teacher_pred_source, batch_source)
+                            teacher_source_loss_val = teacher_source_loss.item() if isinstance(teacher_source_loss, torch.Tensor) else teacher_source_loss
+                            
+                            if source_loss_baseline is None:
+                                source_loss_baseline = teacher_source_loss_val
+                                LOGGER.info(f'[GATE] Teacher source loss baseline: {source_loss_baseline:.4f}')
+                            elif source_loss_baseline > 0 and teacher_source_loss_val > source_loss_baseline * 2.0:
+                                LOGGER.warning(
+                                    f'[GATE] Teacher degraded! Loss {teacher_source_loss_val:.4f} > '
+                                    f'2x baseline {source_loss_baseline:.4f}. Pausing EMA for 500 steps.'
+                                )
+                                teacher_ema.pause_updates(steps=500)
+                            else:
+                                LOGGER.info(
+                                    f'[GATE] Teacher OK: loss={teacher_source_loss_val:.4f} '
+                                    f'(baseline={source_loss_baseline:.4f})'
+                                )
+                    
+                    # ── Pseudo-labels from teacher ──
+                    with torch.no_grad():
+                        pred_teacher = model_teacher(imgs_target_fake)
+                        
+                        if isinstance(pred_teacher, dict):
+                            pred_tensor = pred_teacher.get('one2one', pred_teacher.get('one2many', None))
+                            if pred_tensor is not None:
+                                pred_tensor = pred_tensor[0] if isinstance(pred_tensor, (list, tuple)) else pred_tensor
+                            else:
+                                pred_tensor = torch.zeros(1, 84, 8400, device=device)
+                        elif isinstance(pred_teacher, (list, tuple)):
+                            pred_tensor = pred_teacher[0]
                         else:
-                            pred_tensor = torch.zeros(1, 84, 8400, device=device)
-                    elif isinstance(pred_teacher, (list, tuple)):
-                        pred_tensor = pred_teacher[0]
-                    else:
-                        pred_tensor = pred_teacher
-                    
-                    teacher_output_valid = True
-                    if pred_tensor is not None and isinstance(pred_tensor, torch.Tensor):
-                        if torch.isnan(pred_tensor).any() or torch.isinf(pred_tensor).any():
+                            pred_tensor = pred_teacher
+                        
+                        teacher_output_valid = True
+                        if pred_tensor is not None and isinstance(pred_tensor, torch.Tensor):
+                            if torch.isnan(pred_tensor).any() or torch.isinf(pred_tensor).any():
+                                teacher_output_valid = False
+                                pred_tensor = torch.zeros_like(pred_tensor)
+                        else:
                             teacher_output_valid = False
-                            pred_tensor = torch.zeros_like(pred_tensor)
-                    else:
-                        teacher_output_valid = False
-                        pred_tensor = torch.zeros(1, 6, 8400, device=device)
-                    
-                    # Apply sigmoid if needed
-                    if teacher_output_valid and len(pred_tensor.shape) == 3:
-                        cls_scores = pred_tensor[:, 4:, :]
-                        if cls_scores.max() > 1.0 or cls_scores.min() < 0.0:
-                            pred_tensor = torch.cat([
-                                pred_tensor[:, :4, :],
-                                torch.sigmoid(cls_scores)
-                            ], dim=1)
-                    
-                    # Adaptive confidence threshold (curriculum learning)
-                    # Force higher threshold in early epochs to prevent confirmation bias
-                    if epoch < 10:
-                        adaptive_conf = max(0.7, opt.conf_thres)  # High conf early
-                    else:
+                            pred_tensor = torch.zeros(1, 6, 8400, device=device)
+                        
+                        # Apply sigmoid if needed
+                        if teacher_output_valid and len(pred_tensor.shape) == 3:
+                            cls_scores = pred_tensor[:, 4:, :]
+                            if cls_scores.max() > 1.0 or cls_scores.min() < 0.0:
+                                pred_tensor = torch.cat([
+                                    pred_tensor[:, :4, :],
+                                    torch.sigmoid(cls_scores)
+                                ], dim=1)
+                        
+                        # Adaptive confidence threshold (curriculum learning)
+                        # After burn-in: start strict (max_conf) and relax over time
                         adaptive_conf = get_adaptive_conf_thres(
                             epoch, opt.epochs, opt.conf_thres,
-                            max_conf=getattr(opt, 'conf_thres_max', 0.7)
+                            max_conf=getattr(opt, 'conf_thres_max', 0.7),
+                            burn_in_epochs=burn_in_epochs,
                         )
-                    
-                    # NMS with reduced max_det to prevent box explosion
-                    pseudo_labels = non_max_suppression(
-                        pred_tensor,
-                        conf_thres=adaptive_conf,
-                        iou_thres=opt.iou_thres,
-                        max_det=20,  # Reduced from 50 to prevent overcounting
-                    )
-                    
-                    # Note: rect=True in dataset means no letterbox padding, 
-                    # so no need to filter padding boxes
-                    
-                    img_h, img_w = imgs_target.shape[2:]
-                    valid_coco_classes = set(class_mapping.keys())
-                    
-                    for idx, preds in enumerate(pseudo_labels):
-                        if preds is not None and len(preds) > 0:
-                            preds[:, 0].clamp_(0, img_w)
-                            preds[:, 1].clamp_(0, img_h)
-                            preds[:, 2].clamp_(0, img_w)
-                            preds[:, 3].clamp_(0, img_h)
-                            
-                            valid_box = (preds[:, 2] > preds[:, 0] + 2) & (preds[:, 3] > preds[:, 1] + 2)
-                            cls_ids = preds[:, 5].long()
-                            valid_cls = torch.zeros(len(preds), dtype=torch.bool, device=device)
-                            for coco_cls in valid_coco_classes:
-                                valid_cls |= (cls_ids == coco_cls)
-                            
-                            valid = valid_box & valid_cls
-                            filtered_preds = preds[valid]
-                            
-                            if len(filtered_preds) > 0:
-                                for coco_cls, dataset_cls in class_mapping.items():
-                                    mask = (filtered_preds[:, 5].long() == coco_cls)
-                                    filtered_preds[mask, 5] = dataset_cls
-                            
-                            pseudo_labels[idx] = filtered_preds
-                    
-                    n_pseudo = sum(len(p) if p is not None else 0 for p in pseudo_labels)
-                    
-                    # Debug images (skip in tuning mode to save disk)
-                    tuning_mode = getattr(opt, 'tuning_mode', False)
-                    if not tuning_mode and i % 100 == 0:
-                        debug_dir = save_dir / 'debug_images'
-                        debug_dir.mkdir(exist_ok=True)
-                        n_boxes = save_debug_image(
-                            imgs_target_fake[0],
-                            [pseudo_labels[0]] if pseudo_labels else None,
-                            debug_dir / f'epoch{epoch:03d}_iter{epoch * nb + i:06d}_teacher.jpg',
-                            names,
-                            conf_thres=adaptive_conf
+                        
+                        # NMS with reduced max_det to prevent box explosion
+                        pseudo_labels = non_max_suppression(
+                            pred_tensor,
+                            conf_thres=adaptive_conf,
+                            iou_thres=opt.iou_thres,
+                            max_det=20,
                         )
-                        LOGGER.info(f'[DEBUG] Epoch {epoch}: Teacher detections={n_boxes}, conf={adaptive_conf:.3f}')
+                        
+                        valid_coco_classes = set(class_mapping.keys())
+                        
+                        for idx, preds in enumerate(pseudo_labels):
+                            if preds is not None and len(preds) > 0:
+                                preds[:, 0].clamp_(0, img_w)
+                                preds[:, 1].clamp_(0, img_h)
+                                preds[:, 2].clamp_(0, img_w)
+                                preds[:, 3].clamp_(0, img_h)
+                                
+                                box_w = preds[:, 2] - preds[:, 0]
+                                box_h = preds[:, 3] - preds[:, 1]
+                                box_area = box_w * box_h
+                                img_area = img_w * img_h
+                                
+                                # Track exploded boxes for logging
+                                large_boxes = (box_area >= 0.8 * img_area).sum().item()
+                                if large_boxes > 0 and i == 0:
+                                    LOGGER.warning(f"[WARNING] Epoch {epoch}: Discarded {large_boxes} exploded pseudo-labels (>80% image area). Teacher diverging!")
+                                
+                                # Enforce min dimensions (5x5) and max area (80% of image)
+                                valid_box = (box_w > 5) & (box_h > 5) & (box_area < 0.8 * img_area)
+                                
+                                cls_ids = preds[:, 5].long()
+                                valid_cls = torch.zeros(len(preds), dtype=torch.bool, device=device)
+                                for coco_cls in valid_coco_classes:
+                                    valid_cls |= (cls_ids == coco_cls)
+                                
+                                valid = valid_box & valid_cls
+                                filtered_preds = preds[valid]
+                                
+                                if len(filtered_preds) > 0:
+                                    for coco_cls, dataset_cls in class_mapping.items():
+                                        mask = (filtered_preds[:, 5].long() == coco_cls)
+                                        filtered_preds[mask, 5] = dataset_cls
+                                
+                                pseudo_labels[idx] = filtered_preds
+                        
+                        n_pseudo = sum(len(p) if p is not None else 0 for p in pseudo_labels)
+                        
+                        # Debug images (skip in tuning mode to save disk)
+                        tuning_mode = getattr(opt, 'tuning_mode', False)
+                        if not tuning_mode and i % 100 == 0:
+                            debug_dir = save_dir / 'debug_images'
+                            debug_dir.mkdir(exist_ok=True)
+                            n_boxes = save_debug_image(
+                                imgs_target_fake[0],
+                                [pseudo_labels[0]] if pseudo_labels else None,
+                                debug_dir / f'epoch{epoch:03d}_iter{epoch * nb + i:06d}_teacher.jpg',
+                                names,
+                                conf_thres=adaptive_conf
+                            )
+                            LOGGER.info(f'[DEBUG] Epoch {epoch}: Teacher detections={n_boxes}, conf={adaptive_conf:.3f}')
                 
                 # Distillation loss
                 loss_distillation = compute_loss.compute_distillation_loss(
@@ -522,7 +589,12 @@ def train(opt):
             global_step += 1
             
             if domain_monitor and i % 50 == 0 and i < 500:
-                domain_monitor.collect_features(features_sr=source_features, features_tr=target_features)
+                domain_monitor.collect_features(
+                    features_sr=source_features,
+                    features_sf=source_fake_features,
+                    features_tr=target_features,
+                    max_batches=50,  # More samples for meaningful UMAP
+                )
             
             mem = f'{torch.cuda.memory_reserved() / 1e9:.1f}G' if torch.cuda.is_available() else 'CPU'
             pbar.set_postfix({
@@ -593,10 +665,23 @@ def train(opt):
                 'optimizer': optimizer.state_dict(),
                 'best_fitness': best_fitness,
             }, save_dir / 'weights' / 'last.pt')
+        
+        # Save intermediate checkpoints for pseudo-label quality analysis
+        if epoch in checkpoint_epochs and not getattr(opt, 'tuning_mode', False):
+            ckpt_data = {
+                'epoch': epoch,
+                'model': model_student.state_dict(),
+                'teacher_state_dict': model_teacher.state_dict(),
+                'best_fitness': best_fitness,
+            }
+            torch.save(ckpt_data, save_dir / 'weights' / f'checkpoint_ep{epoch:03d}.pt')
+            LOGGER.info(f'💾 Saved checkpoint: checkpoint_ep{epoch:03d}.pt (student + teacher)')
     
     # Cleanup
     if feature_hook:
         feature_hook.remove()
+    if monitor_hook and monitor_hook is not feature_hook:
+        monitor_hook.remove()
     logger.finalize()
     if domain_monitor:
         domain_monitor.finalize()
@@ -629,7 +714,7 @@ def parse_args():
     
     # Teacher-Student
     parser.add_argument('--teacher-alpha', type=float, default=0.9999)
-    parser.add_argument('--conf-thres', type=float, default=0.5)
+    parser.add_argument('--conf-thres', type=float, default=0.1)
     parser.add_argument('--conf-thres-max', type=float, default=0.7)
     parser.add_argument('--iou-thres', type=float, default=0.45)
     parser.add_argument('--lambda-weight', type=float, default=0.1)
@@ -638,6 +723,7 @@ def parse_args():
     # Progressive
     parser.add_argument('--use-progressive-lambda', action='store_true')
     parser.add_argument('--warmup-epochs', type=int, default=10)
+    parser.add_argument('--burn-in-epochs', type=int, default=50)
     
     # GRL
     parser.add_argument('--use-grl', action='store_true')

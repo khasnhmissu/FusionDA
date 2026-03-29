@@ -128,22 +128,12 @@ def match_predictions(
     all_labels:   Dict[str, List[List[float]]],
     all_predicts: Dict[str, List[List[float]]],
     iou_threshold: float,
+    img_size: Tuple[int, int] = (640, 640),
 ) -> Dict[int, Dict]:
     """
     Với mỗi class, duyệt tất cả predictions (đã sort theo confidence giảm dần),
-    đánh dấu TP / FP và đếm tổng GT (để tính FN sau).
-
-    Returns:
-        {
-          class_id: {
-            "scores":   [conf, ...],   # sorted descending
-            "tp":       [1/0, ...],    # 1 = TP, 0 = FP
-            "n_gt":     int            # tổng số GT box của class này
-          }
-        }
+    đánh dấu TP / FP và tính toán diện tích để phục vụ đo lường mAPs, mAPm, mAPl.
     """
-    # Gom tất cả prediction theo class
-    # entry: (image_name, confidence, box_xywh)
     class_preds: Dict[int, List[Tuple]] = defaultdict(list)
 
     for img_name, preds in all_predicts.items():
@@ -153,56 +143,67 @@ def match_predictions(
             box  = pred[2:]  # [x_c, y_c, w, h]
             class_preds[cls].append((img_name, conf, box))
 
-    # Đếm GT theo class
+    img_w, img_h = img_size
     class_n_gt: Dict[int, int] = defaultdict(int)
+    class_gt_areas: Dict[int, List[float]] = defaultdict(list)
     for img_name, gts in all_labels.items():
         for gt in gts:
-            class_n_gt[int(gt[0])] += 1
+            cls = int(gt[0])
+            class_n_gt[cls] += 1
+            area = gt[3] * gt[4] * img_w * img_h
+            class_gt_areas[cls].append(area)
 
-    # Tập tất cả class_id (union của label + predict)
     all_classes = set(class_n_gt.keys()) | set(class_preds.keys())
 
     results = {}
     for cls in all_classes:
         preds_cls = class_preds.get(cls, [])
-
-        # Sort theo confidence giảm dần
         preds_cls.sort(key=lambda x: x[1], reverse=True)
 
         scores = []
         tp_arr = []
+        pred_areas = []
+        matched_gt_areas = []
 
-        # Track GT đã match (image_name → set of matched gt indices)
         matched_gt: Dict[str, set] = defaultdict(set)
 
         for img_name, conf, pred_box in preds_cls:
             scores.append(conf)
+            p_area = pred_box[2] * pred_box[3] * img_w * img_h
+            pred_areas.append(p_area)
 
             gt_boxes_all = all_labels.get(img_name, [])
             gt_boxes_cls = [
-                (i, gt[1:])  # (original_index, [x_c, y_c, w, h])
+                (i, gt[1:])
                 for i, gt in enumerate(gt_boxes_all)
                 if int(gt[0]) == cls
             ]
 
             best_iou   = 0.0
             best_gt_idx = -1
+            best_gt_area = -1.0
 
             for orig_idx, gt_box in gt_boxes_cls:
                 iou = compute_iou(pred_box, gt_box)
                 if iou > best_iou:
                     best_iou    = iou
                     best_gt_idx = orig_idx
+                    best_gt_area = gt_box[2] * gt_box[3] * img_w * img_h
 
             if best_iou >= iou_threshold and best_gt_idx not in matched_gt[img_name]:
                 tp_arr.append(1)
                 matched_gt[img_name].add(best_gt_idx)
+                matched_gt_areas.append(best_gt_area)
             else:
                 tp_arr.append(0)
+                matched_gt_areas.append(-1.0)
 
         results[cls] = {
             "scores": np.array(scores, dtype=np.float32),
             "tp":     np.array(tp_arr, dtype=np.int32),
+            "matched_gt_areas": np.array(matched_gt_areas, dtype=np.float32),
+            "pred_areas": np.array(pred_areas, dtype=np.float32),
+            "all_gt_areas": np.array(class_gt_areas.get(cls, []), dtype=np.float32),
             "n_gt":   class_n_gt.get(cls, 0),
         }
 
@@ -317,11 +318,13 @@ class DetectionEvaluator:
         predicts_dir:   str,
         conf_threshold: float = 0.5,
         class_names:    Optional[Dict[int, str]] = None,
+        img_size:       Tuple[int, int] = (640, 640),
     ):
         self.labels_dir     = labels_dir
         self.predicts_dir   = predicts_dir
         self.conf_threshold = conf_threshold
         self.class_names    = class_names or {}
+        self.img_size       = img_size
 
         print("📂 Đang load dữ liệu...")
         self.all_labels   = load_labels(labels_dir)
@@ -350,55 +353,101 @@ class DetectionEvaluator:
     def _class_name(self, cls_id: int) -> str:
         return self.class_names.get(cls_id, f"class_{cls_id}")
 
+    def _compute_ap_for_area(self, data: Dict, area_range: Tuple[float, float]) -> float:
+        min_a, max_a = area_range
+        tps = data["tp"]
+        matches_gt_areas = data["matched_gt_areas"]
+        pred_areas = data["pred_areas"]
+        all_gt_areas = data["all_gt_areas"]
+        
+        n_gt = int(np.sum((all_gt_areas >= min_a) & (all_gt_areas < max_a)))
+        
+        filtered_tp = []
+        for tp, m_gt_a, p_a in zip(tps, matches_gt_areas, pred_areas):
+            if m_gt_a >= 0:
+                if min_a <= m_gt_a < max_a:
+                    filtered_tp.append(1)
+            else:
+                if min_a <= p_a < max_a:
+                    filtered_tp.append(0)
+                    
+        if n_gt == 0:
+            if len(filtered_tp) > 0:
+                return 0.0
+            return -1.0
+
+        if len(filtered_tp) == 0:
+            return 0.0
+
+        prec, rec = compute_pr_curve(np.array(filtered_tp), n_gt)
+        return compute_ap(prec, rec)
+
     def evaluate(self) -> Dict:
         """
-        Chạy toàn bộ evaluation. Trả về dict chứa tất cả chỉ số.
+        Chạy toàn bộ evaluation. Trả về dict chứa tất cả chỉ số (bao gồm AP theo size).
         """
         iou_thresholds = np.round(np.arange(0.5, 1.0, 0.05), 2)  # [0.50, 0.55, ..., 0.95]
 
-        # ── AP theo từng IoU threshold ──────────────────
-        ap_table: Dict[float, Dict[int, float]] = {}  # iou_thr → { class_id → AP }
+        area_ranges = {
+            "all": (0.0, float("inf")),
+            "small": (0.0, 32.0 ** 2),
+            "medium": (32.0 ** 2, 96.0 ** 2),
+            "large": (96.0 ** 2, float("inf")),
+        }
+
+        ap_table = {scale: {iou: {} for iou in iou_thresholds} for scale in area_ranges}
 
         for iou_thr in iou_thresholds:
-            class_results = match_predictions(self.all_labels, self.all_predicts, iou_thr)
-            ap_per_class  = {}
-
+            class_results = match_predictions(
+                self.all_labels, self.all_predicts, iou_thr, img_size=self.img_size
+            )
+            
             for cls, data in class_results.items():
-                if data["n_gt"] == 0 and len(data["scores"]) == 0:
-                    continue
-                prec, rec = compute_pr_curve(data["tp"], data["n_gt"])
-                ap_per_class[cls] = compute_ap(prec, rec)
+                for scale, a_range in area_ranges.items():
+                    ap = self._compute_ap_for_area(data, a_range)
+                    if ap >= 0.0:
+                        ap_table[scale][iou_thr][cls] = ap
 
-            ap_table[iou_thr] = ap_per_class
+        def compute_mean_ap(ap_scale_iou_dict):
+            if not ap_scale_iou_dict: return 0.0
+            return float(np.mean(list(ap_scale_iou_dict.values())))
 
-        # ── Tổng hợp mAP ───────────────────────────────
-        all_classes = sorted(
-            set(cls for ap_dict in ap_table.values() for cls in ap_dict)
+        all_classes_valid = sorted(
+            set(cls for ap_dict in ap_table["all"].values() for cls in ap_dict)
         )
 
-        # mAP@50
-        ap50_per_class = ap_table[0.50]
-        map50 = float(np.mean(list(ap50_per_class.values()))) if ap50_per_class else 0.0
+        map50 = compute_mean_ap(ap_table["all"][0.50])
+        map75 = compute_mean_ap(ap_table["all"][0.75])
 
-        # mAP@75
-        ap75_per_class = ap_table[0.75]
-        map75 = float(np.mean(list(ap75_per_class.values()))) if ap75_per_class else 0.0
+        map5095 = 0.0
+        map5095_s = 0.0
+        map5095_m = 0.0
+        map5095_l = 0.0
 
-        # mAP@[.5:.95]
-        map5095_per_class = {}
-        for cls in all_classes:
-            aps = [ap_table[thr][cls] for thr in iou_thresholds if cls in ap_table[thr]]
-            map5095_per_class[cls] = float(np.mean(aps)) if aps else 0.0
-        map5095 = float(np.mean(list(map5095_per_class.values()))) if map5095_per_class else 0.0
+        ap5095_per_class = {}
+        for scale, scale_var in [("all", "map5095"), ("small", "map5095_s"), ("medium", "map5095_m"), ("large", "map5095_l")]:
+            cls_aps = {}
+            scale_classes = set(cls for ap_dict in ap_table[scale].values() for cls in ap_dict)
+            
+            for cls in scale_classes:
+                aps = [ap_table[scale][thr][cls] for thr in iou_thresholds if cls in ap_table[scale][thr]]
+                if aps:
+                    cls_aps[cls] = float(np.mean(aps))
+            
+            m_val = float(np.mean(list(cls_aps.values()))) if cls_aps else 0.0
+            if scale == "all":
+                map5095 = m_val
+                ap5095_per_class = cls_aps
+            elif scale == "small": map5095_s = m_val
+            elif scale == "medium": map5095_m = m_val
+            elif scale == "large": map5095_l = m_val
 
-        # ── Precision / Recall / F1 tại IoU=0.5 ───────
-        class_results_50 = match_predictions(self.all_labels, self.all_predicts, 0.5)
+        class_results_50 = match_predictions(self.all_labels, self.all_predicts, 0.5, img_size=self.img_size)
         prf_per_class    = compute_prf_at_threshold(
             class_results_50,
             conf_threshold=self.conf_threshold,
         )
 
-        # ── PR Curve data (cho IoU=0.5, để vẽ nếu cần) ─
         pr_curves = {}
         for cls, data in class_results_50.items():
             prec, rec = compute_pr_curve(data["tp"], data["n_gt"])
@@ -408,12 +457,15 @@ class DetectionEvaluator:
             "mAP@50":         round(map50,   4),
             "mAP@75":         round(map75,   4),
             "mAP@[.5:.95]":   round(map5095, 4),
-            "AP@50_per_class":      ap50_per_class,
-            "AP@75_per_class":      ap75_per_class,
-            "AP@[.5:.95]_per_class": map5095_per_class,
+            "mAP_s":          round(map5095_s, 4),
+            "mAP_m":          round(map5095_m, 4),
+            "mAP_l":          round(map5095_l, 4),
+            "AP@50_per_class":      ap_table["all"][0.50],
+            "AP@75_per_class":      ap_table["all"][0.75],
+            "AP@[.5:.95]_per_class": ap5095_per_class,
             "PRF_per_class":        prf_per_class,
             "PR_curves":            pr_curves,
-            "all_classes":          all_classes,
+            "all_classes":          all_classes_valid,
         }
 
     def print_report(self, results: Dict, show_per_class: bool = True) -> None:
@@ -431,6 +483,9 @@ class DetectionEvaluator:
         print(f"  {'mAP@50':<25} {results['mAP@50']:.4f}")
         print(f"  {'mAP@75':<25} {results['mAP@75']:.4f}")
         print(f"  {'mAP@[.5:.95]':<25} {results['mAP@[.5:.95]']:.4f}")
+        print(f"  {'mAP_s (Small)':<25} {results['mAP_s']:.4f}")
+        print(f"  {'mAP_m (Medium)':<25} {results['mAP_m']:.4f}")
+        print(f"  {'mAP_l (Large)':<25} {results['mAP_l']:.4f}")
 
         # Macro Precision / Recall / F1
         prf = results["PRF_per_class"]
@@ -623,6 +678,7 @@ if __name__ == "__main__":
     parser.add_argument("--labels",   type=str, default=None,  help="Đường dẫn folder labels")
     parser.add_argument("--predicts", type=str, default=None,  help="Đường dẫn folder predicts")
     parser.add_argument("--conf",     type=float, default=0.5, help="Confidence threshold (default: 0.5)")
+    parser.add_argument("--img-size", type=int, nargs="+", default=[640, 640], help="Kích thước ảnh gốc W H (mặc định: 640 640)")
     parser.add_argument("--plot",     action="store_true",     help="Vẽ PR curves")
     parser.add_argument("--save-plot",type=str, default=None,  help="Lưu PR curves ra file ảnh")
     parser.add_argument("--demo",     action="store_true",     help="Chạy với dữ liệu demo")
@@ -639,6 +695,8 @@ if __name__ == "__main__":
         labels_dir   = args.labels
         predicts_dir = args.predicts
 
+    img_size = tuple(args.img_size) if len(args.img_size) == 2 else (args.img_size[0], args.img_size[0])
+
     class_names = {0: "person", 1: "car"}  # Tuỳ chỉnh theo project
 
     evaluator = DetectionEvaluator(
@@ -646,6 +704,7 @@ if __name__ == "__main__":
         predicts_dir   = predicts_dir,
         conf_threshold = args.conf,
         class_names    = class_names,
+        img_size       = img_size,
     )
 
     results = evaluator.evaluate()

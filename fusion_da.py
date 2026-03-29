@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from copy import deepcopy
@@ -9,15 +10,18 @@ from ultralytics.cfg import get_cfg
 
 class WeightEMA(nn.Module):
     """
-    Exponential Moving Average for Mean Teacher.
+    Exponential Moving Average for Mean Teacher with anti-collapse safeguards.
     
-    θ_teacher = α * θ_teacher + (1-α) * θ_student
+    θ_teacher = α_eff * θ_teacher + (1-α_eff) * θ_student
     
     Key design:
     - Only parameters updated, buffers (BatchNorm) stay frozen
     - Teacher always in eval mode
     - Call update() AFTER optimizer.step()
     - update_after_step: Delay EMA updates to let student stabilize
+    - Cosine alpha ramp-up: α_eff starts at 1.0 (no update) and slowly
+      decreases to target α, preventing early noise from poisoning teacher
+    - pause_updates(): External quality gating to halt EMA when teacher degrades
     """
     
     def __init__(
@@ -26,7 +30,8 @@ class WeightEMA(nn.Module):
             alpha: float = 0.999,
             freeze_teacher: bool = False,
             device: Optional[torch.device] = None,
-            update_after_step: int = 500,  # Delay EMA updates
+            update_after_step: int = 2000,      # Delay EMA updates (was 500)
+            alpha_rampup_steps: int = 5000,      # Cosine ramp-up period
     ):
         super().__init__()
         
@@ -38,9 +43,11 @@ class WeightEMA(nn.Module):
         self.freeze_teacher = freeze_teacher
         self.device = device
         self.update_after_step = update_after_step
+        self.alpha_rampup_steps = alpha_rampup_steps
         self.updates = 0
         self.step_count = 0
         self.nan_count = 0
+        self._pause_remaining = 0  # Steps to pause updates
         
         if device is not None:
             self.module.to(device=device)
@@ -48,6 +55,11 @@ class WeightEMA(nn.Module):
         # Disable gradients - teacher is never trained directly
         for p in self.module.parameters():
             p.requires_grad_(False)
+        
+        # Save initial teacher state for divergence monitoring
+        self._initial_param_norm = sum(
+            p.data.norm().item() for p in self.module.parameters()
+        )
         
         n_params = sum(1 for _ in self.module.parameters())
         n_buffers = sum(1 for _ in self.module.buffers())
@@ -57,6 +69,12 @@ class WeightEMA(nn.Module):
         else:
             print(f"[WeightEMA] alpha={alpha}, {n_params} params (EMA), {n_buffers} buffers (frozen)")
             print(f"[WeightEMA] EMA updates start after step {update_after_step}")
+            print(f"[WeightEMA] Alpha ramp-up over {alpha_rampup_steps} steps after delay")
+    
+    def pause_updates(self, steps: int = 500):
+        """Pause EMA updates for N steps (called when teacher quality degrades)."""
+        self._pause_remaining = steps
+        print(f"[WeightEMA] ⚠️ Pausing EMA updates for {steps} steps")
     
     @torch.no_grad()
     def update(self, model):
@@ -73,27 +91,57 @@ class WeightEMA(nn.Module):
                 print(f"[EMA] Step {self.step_count}: waiting until step {self.update_after_step}")
             return
         
-        teacher_params = list(self.module.parameters())
-        student_params = list(model.parameters())
+        # Honor pause requests from quality gating
+        if self._pause_remaining > 0:
+            self._pause_remaining -= 1
+            if self._pause_remaining % 100 == 0:
+                print(f"[EMA] Paused, {self._pause_remaining} steps remaining")
+            return
+        
+        # Get full state dicts to include BOTH parameters AND buffers (like BatchNorm stats)
+        teacher_state = self.module.state_dict()
+        student_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
         
         # Check for NaN in student
-        for sp in student_params:
-            if torch.isnan(sp.data).any() or torch.isinf(sp.data).any():
+        for _, sp in student_state.items():
+            if sp.dtype.is_floating_point and (torch.isnan(sp).any() or torch.isinf(sp).any()):
                 self.nan_count += 1
                 if self.nan_count <= 5:
-                    print(f"[WeightEMA] Student has NaN/Inf, skipping")
+                    print(f"[WeightEMA] Student has NaN/Inf, skipping iteration")
                 return
         
-        # EMA: θ = α*θ + (1-α)*θ_student
-        one_minus_alpha = 1.0 - self.alpha
-        for tp, sp in zip(teacher_params, student_params):
-            tp.data.mul_(self.alpha)
-            tp.data.add_(sp.data * one_minus_alpha)
+        # Cosine alpha ramp-up: effective_alpha starts at 1.0 (no update)
+        # and slowly decreases to self.alpha over alpha_rampup_steps.
+        # This prevents early noisy student updates from poisoning the teacher.
+        steps_since_start = self.step_count - self.update_after_step
+        ramp_progress = min(steps_since_start / max(self.alpha_rampup_steps, 1), 1.0)
+        # Cosine schedule: 1.0 → self.alpha
+        effective_alpha = 1.0 - (1.0 - self.alpha) * (1 - math.cos(math.pi * ramp_progress)) / 2
+        
+        # EMA: θ = α_eff*θ + (1-α_eff)*θ_student
+        one_minus_alpha = 1.0 - effective_alpha
+        for k, tp in teacher_state.items():
+            if k not in student_state:
+                continue
+                
+            sp = student_state[k]
+            
+            if tp.dtype.is_floating_point:
+                # Continuous parameters and buffers (Conv weights, running_mean, running_var)
+                tp.data.mul_(effective_alpha)
+                tp.data.add_(sp.data.detach() * one_minus_alpha)
+            else:
+                # Integer buffers (e.g. num_batches_tracked)
+                tp.data.copy_(sp.data)
         
         self.updates += 1
         
         if self.updates % 500 == 0:
-            print(f"[EMA] Update {self.updates}: α={self.alpha:.6f}")
+            # Monitor parameter divergence
+            current_norm = sum(p.data.norm().item() for p in self.module.parameters())
+            drift = abs(current_norm - self._initial_param_norm) / max(self._initial_param_norm, 1e-8)
+            print(f"[EMA] Update {self.updates}: α_eff={effective_alpha:.6f} "
+                  f"(target α={self.alpha:.6f}), drift={drift:.4f}")
     
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)

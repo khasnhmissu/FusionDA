@@ -17,17 +17,25 @@ training:
   device: "0"
 
 # Mean Teacher EMA
-# Formula: θ_teacher = α * θ_teacher + (1-α) * θ_student
+# Formula: θ_teacher = α_eff * θ_teacher + (1-α_eff) * θ_student
+# α_eff starts at 1.0 (no update) and ramps down to alpha over alpha_rampup_steps
 # Only PARAMETERS updated, BUFFERS (BatchNorm) stay frozen
 # Teacher always in eval mode, update called AFTER optimizer.step()
 teacher:
   freeze_teacher: false           # If true, no EMA updates
   alpha: 0.9999                    # Higher = slower adaptation
+  update_after_step: 2000          # Wait N steps before first EMA update
+  alpha_rampup_steps: 5000         # Cosine ramp-up: α_eff goes 1.0 → alpha
+
+# Burn-in: no distillation during early epochs
+# Student learns ONLY from GT first, preventing confirmation bias
+burn_in:
+  epochs: 10                       # No pseudo labels for first 10 epochs
 
 # Distillation (Teacher → Student knowledge transfer)
 distillation:
-  conf_thres_min: 0.5             # Curriculum: start low
-  conf_thres_max: 0.7             # Curriculum: end high
+  conf_thres_min: 0.1           
+  conf_thres_max: 0.5             
   iou_thres: 0.45
   lambda_weight: 0.1              # Distillation loss weight
   use_progressive_lambda: true
@@ -63,3 +71,4 @@ performance:
   amp: true
   cache_clear_interval: 200
   gradient_clip: 2.0
+

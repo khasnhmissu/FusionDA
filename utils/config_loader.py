@@ -30,9 +30,17 @@ class TrainingConfig:
 
 @dataclass
 class TeacherConfig:
-    """EMA config: θ_teacher = α * θ_teacher + (1-α) * θ_student"""
+    """EMA config: θ_teacher = α_eff * θ_teacher + (1-α_eff) * θ_student"""
     alpha: float = 0.999
     freeze_teacher: bool = False
+    update_after_step: int = 2000      # Delay before first EMA update
+    alpha_rampup_steps: int = 5000     # Cosine ramp-up for α_eff
+
+
+@dataclass
+class BurnInConfig:
+    """No distillation during burn-in to prevent confirmation bias."""
+    epochs: int = 20
 
 
 @dataclass
@@ -84,6 +92,7 @@ class FDAConfig:
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     teacher: TeacherConfig = field(default_factory=TeacherConfig)
+    burn_in: BurnInConfig = field(default_factory=BurnInConfig)
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
     grl: GRLConfig = field(default_factory=GRLConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -115,6 +124,7 @@ def load_config(config_path: Optional[str] = None) -> FDAConfig:
         'data': config.data,
         'training': config.training,
         'teacher': config.teacher,
+        'burn_in': config.burn_in,
         'distillation': config.distillation,
         'grl': config.grl,
         'output': config.output,
@@ -154,6 +164,11 @@ def config_to_namespace(config: FDAConfig) -> Namespace:
     # Teacher
     ns.teacher_alpha = config.teacher.alpha
     ns.freeze_teacher = config.teacher.freeze_teacher
+    ns.update_after_step = config.teacher.update_after_step
+    ns.alpha_rampup_steps = config.teacher.alpha_rampup_steps
+    
+    # Burn-in
+    ns.burn_in_epochs = config.burn_in.epochs
     
     # Distillation
     ns.conf_thres = config.distillation.conf_thres_min
