@@ -43,22 +43,20 @@ class DomainDiscriminator(nn.Module):
         self.grl = GradientReversalLayer(alpha=1.0)
         
         self.discriminator = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(in_channels, hidden_dim),
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=1, stride=1),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=1, stride=1),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Dropout2d(dropout),
+            nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, stride=1)
         )
         
         self._init_weights()
     
     def _init_weights(self):
         for m in self.discriminator.modules():
-            if isinstance(m, nn.Linear):
+            if isinstance(m, nn.Conv2d):
                 nn.init.xavier_normal_(m.weight, gain=0.1)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
@@ -66,7 +64,7 @@ class DomainDiscriminator(nn.Module):
     def forward(self, x, alpha=None):
         # Safety check for NaN/Inf
         if torch.isnan(x).any() or torch.isinf(x).any():
-            return torch.zeros(x.size(0), 1, device=x.device, requires_grad=True)
+            return torch.zeros(x.size(0), 1, x.size(2), x.size(3), device=x.device, requires_grad=True)
         
         if alpha is not None:
             self.grl.alpha = alpha
@@ -76,11 +74,15 @@ class DomainDiscriminator(nn.Module):
 
 class YOLOv8FeatureHook:
     """
-    Hook to extract features from YOLOv8 backbone.
-    
-    Layer indices:
+    Hook để extract features từ backbone cuối (YOLO26s hoặc YOLOv8).
+
+    Dùng find_last_backbone_layer() để auto-detect đúng layer.
+    YOLO26s approximate:
+    - 8: SPPF
+    - 9: C2PSA  <- Recommended (attention-aware features)
+    YOLOv8 classic:
     - 4: C2f (P3)
-    - 6: C2f (P4)  
+    - 6: C2f (P4)
     - 9: SPPF (backbone output) <- Default
     """
     
@@ -131,14 +133,15 @@ class YOLOv8FeatureHook:
 
 def get_grl_alpha(epoch, total_epochs, warmup_epochs=10, max_alpha=1.0):
     """
-    Progressive GRL alpha using quadratic schedule.
-    Returns 0 during warmup, then increases to max_alpha.
+    Progressive GRL alpha using DANN schedule.
+    Returns 0 during warmup, then increases smoothly to max_alpha.
     """
     if epoch < warmup_epochs:
         return 0.0
     
-    progress = min((epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1), 1.0)
-    return max_alpha * (progress ** 2)
+    p = min((epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1), 1.0)
+    alpha = 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0
+    return max_alpha * alpha
 
 
 def compute_domain_loss(domain_pred_source, domain_pred_target):
@@ -148,12 +151,8 @@ def compute_domain_loss(domain_pred_source, domain_pred_target):
         torch.isinf(domain_pred_source).any() or torch.isinf(domain_pred_target).any()):
         return torch.tensor(0.0, device=domain_pred_source.device, requires_grad=True)
     
-    # Clamp to prevent extreme gradients
-    domain_pred_source = torch.clamp(domain_pred_source, -10, 10)
-    domain_pred_target = torch.clamp(domain_pred_target, -10, 10)
-    
-    source_labels = torch.ones(domain_pred_source.size(0), 1, device=domain_pred_source.device)
-    target_labels = torch.zeros(domain_pred_target.size(0), 1, device=domain_pred_target.device)
+    source_labels = torch.ones_like(domain_pred_source)
+    target_labels = torch.zeros_like(domain_pred_target)
     
     loss_source = F.binary_cross_entropy_with_logits(domain_pred_source, source_labels)
     loss_target = F.binary_cross_entropy_with_logits(domain_pred_target, target_labels)
@@ -166,11 +165,47 @@ def get_domain_accuracy(domain_pred_source, domain_pred_target):
     with torch.no_grad():
         source_correct = (domain_pred_source > 0).float().sum()
         target_correct = (domain_pred_target <= 0).float().sum()
-        total = domain_pred_source.size(0) + domain_pred_target.size(0)
+        total = domain_pred_source.numel() + domain_pred_target.numel()
         return ((source_correct + target_correct) / total).item()
 
 
+def find_last_backbone_layer(model):
+    """
+    Auto-detect index của layer cuối backbone (SPPF hoặc C2PSA).
+    Ưu tiên C2PSA nếu có (YOLO26), fallback về SPPF, fallback về 9.
+    Tìm kiếm từ cuối model để lấy layer backbone cuối cùng trước head.
+    """
+    layers = None
+    if hasattr(model, 'model') and isinstance(model.model, nn.Sequential):
+        layers = model.model
+    elif hasattr(model, 'model') and hasattr(model.model, 'model'):
+        layers = model.model.model
+    elif isinstance(model, nn.Sequential):
+        layers = model
+    else:
+        try:
+            layers = model.model
+        except Exception:
+            return 9
+
+    # Tìm C2PSA cuối cùng (YOLO26) hoặc SPPF (YOLOv8)
+    last_c2psa = last_sppf = -1
+    for idx, layer in enumerate(layers):
+        name = layer.__class__.__name__
+        if name == 'C2PSA':
+            last_c2psa = idx
+        elif name == 'SPPF':
+            last_sppf = idx
+
+    if last_c2psa >= 0:
+        return last_c2psa  # YOLO26: C2PSA là layer cuối backbone
+    if last_sppf >= 0:
+        return last_sppf   # YOLOv8: SPPF là layer cuối backbone
+    return 9               # Fallback cứng
+
+
 def create_feature_hook(model, layer_name='backbone'):
-    """Create feature hook for YOLOv8."""
-    layer_idx = 9 if layer_name == 'backbone' else 12
+    """Create feature hook for YOLO26/YOLOv8. Auto-detects backbone end layer."""
+    layer_idx = find_last_backbone_layer(model)
+    print(f"[FeatureHook] Auto-detected backbone end layer: {layer_idx}")
     return YOLOv8FeatureHook(model, layer_idx=layer_idx)

@@ -13,7 +13,7 @@ Usage:
     python pseudo_label_quality.py \
         --checkpoints-dir results/full-yolov8/weights \
         --option-name "Full (GRL)" \
-        --weights yolov8l.pt \
+        --weights yolo26s.pt \
         --target-images datasets/target_real/target_real/val/images \
         --target-labels datasets/target_real/target_real/val/labels \
         --output results_explainable/pseudo_label_quality \
@@ -27,7 +27,7 @@ Usage:
             results/freeze_teacher-yolov8/weights \
             results/freeze_teacher-nogrl-yolov8/weights \
         --compare-names "Full (GRL)" "NoGRL" "Freeze Full" "Freeze NoGRL" \
-        --weights yolov8l.pt \
+        --weights yolo26s.pt \
         --target-images datasets/target_real/target_real/val/images \
         --target-labels datasets/target_real/target_real/val/labels \
         --output results_explainable/pseudo_label_quality \
@@ -100,6 +100,14 @@ def parse_model_output(pred, device):
         pred_tensor = pred[0]
     else:
         pred_tensor = pred
+
+    if len(pred_tensor.shape) == 3 and pred_tensor.shape[-1] == 6:
+        return pred_tensor
+
+    # YOLO26 eval: có thể trả về [B, N, 4+nc] thay vì [B, 4+nc, N]
+    if len(pred_tensor.shape) == 3:
+        if pred_tensor.shape[-1] > pred_tensor.shape[1]:
+            pred_tensor = pred_tensor.permute(0, 2, 1)
     if len(pred_tensor.shape) == 3:
         cls_scores = pred_tensor[:, 4:, :]
         if cls_scores.max() > 1.0 or cls_scores.min() < 0.0:
@@ -570,7 +578,7 @@ def parse_args():
     parser.add_argument('--option-name', type=str, default='Model', help='Option name')
     
     # Common
-    parser.add_argument('--weights', type=str, default='yolov8l.pt', help='YOLOv8 architecture weights')
+    parser.add_argument('--weights', type=str, default='yolo26s.pt', help='YOLO26/YOLOv8 architecture weights')
     parser.add_argument('--target-images', type=str, required=True, help='Target validation images dir')
     parser.add_argument('--target-labels', type=str, required=True, help='Target validation labels dir')
     parser.add_argument('--output', type=str, default='results_explainable/pseudo_label_quality')

@@ -1,20 +1,20 @@
 """
 Baseline Training Script (Dual-Domain Supervised)
 ===================================================
-Train YOLOv8 on both source (clear) and target (foggy) data with labels.
+Train YOLO26/YOLOv8 on both source (clear) and target (foggy) data with labels.
 No domain adaptation techniques — just standard supervised training on both domains.
 
 This serves as a baseline to compare against FDA (train.py).
 
 Usage:
     # Train on both source + target (default, uses data.yaml)
-    python train_baseline.py --data data.yaml --weights yolov8n.pt --epochs 100 --name baseline_combined
+    python train_baseline.py --data data.yaml --weights yolo26s.pt --epochs 100 --name baseline_combined
 
     # Train on source only
-    python train_baseline.py --data data_clear.yaml --weights yolov8n.pt --epochs 100 --name baseline_source_only
+    python train_baseline.py --data data_clear.yaml --weights yolo26s.pt --epochs 100 --name baseline_source_only
 
     # Train on target only
-    python train_baseline.py --data data_foggy.yaml --weights yolov8n.pt --epochs 100 --name baseline_target_only
+    python train_baseline.py --data data_foggy.yaml --weights yolo26s.pt --epochs 100 --name baseline_target_only
 """
 
 import argparse
@@ -34,7 +34,7 @@ from ultralytics.utils import LOGGER, colorstr
 
 
 def train(opt):
-    """Train YOLOv8 baseline model on source + target domains (both labeled)."""
+    """Train YOLO26/YOLOv8 baseline model on source + target domains (both labeled)."""
 
     device = torch.device(f'cuda:{opt.device}' if opt.device.isdigit() else opt.device)
     save_dir = Path(opt.project) / opt.name
@@ -152,11 +152,15 @@ def train(opt):
     val_path_full = str(root / val_path)
     LOGGER.info(f'Validation/Test: {val_path_full}')
 
-    # Loss function (use built-in YOLO loss)
-    # v8DetectionLoss needs model.args as namespace (not dict) for .box, .cls, .dfl
+    # Loss function (use E2ELoss for YOLO26 NMS-free, fallback to v8DetectionLoss for YOLOv8/11)
+    # v8DetectionLoss requires model.args.dfl (checked at line 450 of ultralytics/utils/loss.py)
     model.args = default_cfg
-    from ultralytics.utils.loss import v8DetectionLoss
-    compute_loss = v8DetectionLoss(model)
+    try:
+        from ultralytics.utils.loss import E2ELoss
+        compute_loss = E2ELoss(model)
+    except ImportError:
+        from ultralytics.utils.loss import v8DetectionLoss
+        compute_loss = v8DetectionLoss(model)
 
     # AMP
     use_amp = opt.amp and device.type != 'cpu'
@@ -280,10 +284,10 @@ def train(opt):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='YOLOv8 Baseline Training (Dual-Domain)')
+    parser = argparse.ArgumentParser(description='YOLO26/YOLOv8 Baseline Training (Dual-Domain)')
 
     # Model
-    parser.add_argument('--weights', type=str, default='yolov8n.pt', help='Pretrained weights')
+    parser.add_argument('--weights', type=str, default='yolo26s.pt', help='Pretrained weights')
     parser.add_argument('--data', type=str, default='data.yaml', help='Dataset YAML file (supports multi-domain)')
     parser.add_argument('--imgsz', type=int, default=640, help='Image size')
 
@@ -312,7 +316,7 @@ if __name__ == '__main__':
     args = parse_args()
 
     print("=" * 60)
-    print("YOLOv8 Baseline Training (Source + Target Supervised)")
+    print("YOLO26/YOLOv8 Baseline Training (Source + Target Supervised)")
     print("=" * 60)
     print(f"Data:    {args.data}")
     print(f"Weights: {args.weights}")

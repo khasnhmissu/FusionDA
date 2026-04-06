@@ -3,9 +3,18 @@ import torch
 import torch.nn as nn
 from copy import deepcopy
 from typing import Optional
-from ultralytics.utils.loss import v8DetectionLoss
+# YOLO26 là NMS-free end-to-end model → dùng E2ELoss
+# YOLOv8/11 (có NMS) → dùng v8DetectionLoss
+try:
+    from ultralytics.utils.loss import E2ELoss as _DetLoss
+    _IS_E2E = True
+except ImportError:
+    from ultralytics.utils.loss import v8DetectionLoss as _DetLoss
+    _IS_E2E = False
 from ultralytics.utils.ops import xyxy2xywhn
 from ultralytics.cfg import get_cfg
+
+# custom_loss.py giữ nguyên trong repo nhưng không import nữa (dùng loss chuẩn YOLO26)
 
 
 class WeightEMA(nn.Module):
@@ -241,11 +250,15 @@ class PairedMultiDomainDataset(torch.utils.data.Dataset):
 class DualDomainDataset(torch.utils.data.Dataset):
     """Dataset loading paired real and fake (style-transferred) images."""
     
-    def __init__(self, real_paths, fake_paths, imgsz=640, augment=True):
+    # Minimal data dict required by YOLODataset (channels, names are accessed in cache_labels/build_transforms)
+    _MINIMAL_DATA = {'channels': 3, 'names': {0: 'object'}, 'nc': 1}
+
+    def __init__(self, real_paths, fake_paths, imgsz=640, augment=True, data=None):
         from ultralytics.data.dataset import YOLODataset
         
-        self.real_dataset = YOLODataset(img_path=real_paths, imgsz=imgsz, augment=augment, cache=False)
-        self.fake_dataset = YOLODataset(img_path=fake_paths, imgsz=imgsz, augment=augment, cache=False) if fake_paths else None
+        _data = data or self._MINIMAL_DATA
+        self.real_dataset = YOLODataset(img_path=real_paths, imgsz=imgsz, augment=augment, cache=False, data=_data)
+        self.fake_dataset = YOLODataset(img_path=fake_paths, imgsz=imgsz, augment=augment, cache=False, data=_data) if fake_paths else None
         self.n = len(self.real_dataset)
     
     def __len__(self):
@@ -268,12 +281,13 @@ class DualDomainDataset(torch.utils.data.Dataset):
         }
 
 
-def create_dual_dataloader(real_paths, fake_paths, imgsz, batch_size, workers=4, augment=True):
+def create_dual_dataloader(real_paths, fake_paths, imgsz, batch_size, workers=4, augment=True, data=None):
     """Create dataloader for dual-domain images."""
     from ultralytics.data import YOLODataset
     from ultralytics.data.build import InfiniteDataLoader
     
-    dataset = YOLODataset(img_path=real_paths, imgsz=imgsz, augment=augment, cache=False, batch_size=batch_size)
+    _data = data or {'channels': 3, 'names': {0: 'object'}, 'nc': 1}
+    dataset = YOLODataset(img_path=real_paths, imgsz=imgsz, augment=augment, cache=False, batch_size=batch_size, data=_data)
     
     return InfiniteDataLoader(
         dataset, batch_size=batch_size, shuffle=True,
@@ -282,26 +296,48 @@ def create_dual_dataloader(real_paths, fake_paths, imgsz, batch_size, workers=4,
 
 
 class FDALoss:
-    """Combined loss for FDA training using Ultralytics v8DetectionLoss."""
+    """
+    Combined loss for FDA training.
+
+    Loss selection dựa trên architecture:
+    - YOLO26 (NMS-free, end-to-end): sử dụng E2ELoss (one2many + one2one objectives)
+    - YOLOv8/11 (NMS): sử dụng v8DetectionLoss (fallback)
+
+    Args:
+        model:         De-paralleled student model.
+        class_mapping: COCO class ID → Dataset class ID mapping.
+        box_gain:      Hyperparameter weight for box/IoU loss.
+        cls_gain:      Hyperparameter weight for classification loss.
+        dfl_gain:      DFL loss weight (v8DetectionLoss cần trường này).
+    """
     
-    def __init__(self, model, class_mapping=None):
+    def __init__(
+        self,
+        model,
+        class_mapping=None,
+        box_gain:  float = 7.5,
+        cls_gain:  float = 0.5,
+        dfl_gain:  float = 1.5,   # v8DetectionLoss bắt buộc có hyp.dfl
+    ):
         from ultralytics.utils import IterableSimpleNamespace
-        
+
         # Class mapping: COCO ID → Dataset ID
         self.class_mapping = class_mapping or {0: 0, 1: 1, 2: 1}
-        
+
         hyp = IterableSimpleNamespace(
-            box=7.5, cls=0.5, dfl=1.5, pose=12.0, kobj=1.0,
+            box=box_gain, cls=cls_gain, dfl=dfl_gain, pose=12.0, kobj=1.0,
             lr0=0.01, lrf=0.01, momentum=0.937, weight_decay=0.0005,
             warmup_epochs=3.0, warmup_momentum=0.8, warmup_bias_lr=0.1,
             hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
             degrees=0.0, translate=0.1, scale=0.5, shear=0.0, perspective=0.0,
             flipud=0.0, fliplr=0.5, mosaic=1.0, mixup=0.0, copy_paste=0.0,
             label_smoothing=0.0, nbs=64, overlap_mask=True, mask_ratio=4, dropout=0.0,
+            epochs=200,   # cần cho E2ELoss.decay()
         )
-        
+
         model.args = hyp
-        self.detection_loss = v8DetectionLoss(model)
+
+        self.detection_loss = _DetLoss(model)   # E2ELoss (YOLO26) hoặc v8DetectionLoss (YOLOv8)
         self.detection_loss.hyp = hyp
         self.device = next(model.parameters()).device
     

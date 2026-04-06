@@ -16,7 +16,7 @@ set -e  # Dừng khi có lỗi
 # ============================================================================
 
 DEVICE="0"
-WEIGHTS="yolov8l.pt"
+WEIGHTS="yolo26s.pt"
 DATA="data.yaml"
 EPOCHS=200
 BATCH=4
@@ -26,35 +26,35 @@ TARGET_IMAGES="datasets/target_real/target_real/val/images"
 TARGET_LABELS="datasets/target_real/target_real/val/labels"
 
 # Output directories
-RESULTS_DIR="results_explainable"
+RESULTS_DIR="results"
 
-# echo "============================================"
-# echo "  FusionDA Explainability Pipeline"
-# echo "============================================"
+echo "============================================"
+echo "  FusionDA Explainability Pipeline"
+echo "============================================"
 
 # # ============================================================================
 # # BƯỚC 1: TRAIN LẠI 4 OPTIONS (với checkpoint mỗi 50 epoch)
 # # ============================================================================
 
-# echo ""
-# echo "========================================"
-# echo " STEP 1: Training 4 options"
-# echo "========================================"
+echo ""
+echo "========================================"
+echo " STEP 1: Training 4 options"
+echo "========================================"
 
-# # 1a. Full (GRL) — EMA + GRL
-# echo ">>> Training: Full (GRL)"
-# python train.py \
-#     --weights $WEIGHTS \
-#     --data $DATA \
-#     --epochs $EPOCHS \
-#     --batch $BATCH \
-#     --device $DEVICE \
-#     --use-grl \
-#     --enable-monitoring \
-#     --project $RESULTS_DIR \
-#     --name full-yolov8
+# 1a. Full (GRL) — EMA + GRL
+echo ">>> Training: Full (GRL)"
+python train.py \
+    --weights $WEIGHTS \
+    --data $DATA \
+    --epochs $EPOCHS \
+    --batch $BATCH \
+    --device $DEVICE \
+    --use-grl \
+    --enable-monitoring \
+    --project $RESULTS_DIR \
+    --name full
 
-# # 1b. NoGRL — EMA + No GRL
+# 1b. NoGRL — EMA + No GRL
 # echo ">>> Training: NoGRL"
 # python train.py \
 #     --weights $WEIGHTS \
@@ -64,37 +64,11 @@ RESULTS_DIR="results_explainable"
 #     --device $DEVICE \
 #     --enable-monitoring \
 #     --project $RESULTS_DIR \
-#     --name nogrl-yolov8
+#     --name nogrl
 
-# # 1c. Freeze Full — Frozen Teacher + GRL
-# echo ">>> Training: Freeze Full"
-# python train.py \
-#     --weights $WEIGHTS \
-#     --data $DATA \
-#     --epochs $EPOCHS \
-#     --batch $BATCH \
-#     --device $DEVICE \
-#     --use-grl \
-#     --freeze-teacher \
-#     --enable-monitoring \
-#     --project $RESULTS_DIR \
-#     --name freeze_teacher-yolov8
 
-# # 1d. Freeze NoGRL — Frozen Teacher + No GRL
-# echo ">>> Training: Freeze NoGRL"
-# python train.py \
-#     --weights $WEIGHTS \
-#     --data $DATA \
-#     --epochs $EPOCHS \
-#     --batch $BATCH \
-#     --device $DEVICE \
-#     --freeze-teacher \
-#     --enable-monitoring \
-#     --project $RESULTS_DIR \
-#     --name freeze_teacher-nogrl-yolov8
-
-# echo ""
-# echo "✅ All 4 models trained!"
+echo ""
+echo "✅ All trained!"
 
 # ============================================================================
 # BƯỚC 2: PSEUDO-LABEL QUALITY (RQ1)
@@ -107,11 +81,8 @@ echo "========================================"
 
 python pseudo_label_quality.py --compare \
     --compare-dirs \
-        $RESULTS_DIR/nogrl-yolov8/weights \
-        $RESULTS_DIR/full-yolov8/weights \
-        $RESULTS_DIR/freeze_teacher-yolov8/weights \
-        $RESULTS_DIR/freeze_teacher-nogrl-yolov8/weights \
-    --compare-names "Full (GRL)" "NoGRL" "Freeze Full" "Freeze NoGRL" \
+        $RESULTS_DIR/full/weights \
+    --compare-names "Full (GRL)" \
     --weights $WEIGHTS \
     --target-images $TARGET_IMAGES \
     --target-labels $TARGET_LABELS \
@@ -124,25 +95,25 @@ echo "✅ Pseudo-label quality analysis complete!"
 # BƯỚC 3: EIGENCAM VISUALIZATION (RQ2)
 # ============================================================================
 
-# echo ""
-# echo "========================================"
-# echo " STEP 3: EigenCAM Visualization"
-# echo "========================================"
+echo ""
+echo "========================================"
+echo " STEP 3: EigenCAM Visualization"
+echo "========================================"
 
-# python gradcam_explain.py \
-#     --weights $WEIGHTS \
-#     --checkpoints \
-#         $RESULTS_DIR/full-yolov8/weights/best.pt \
-#         $RESULTS_DIR/nogrl-yolov8/weights/best.pt \
-#         $RESULTS_DIR/freeze_teacher-yolov8/weights/best.pt \
-#         $RESULTS_DIR/freeze_teacher-nogrl-yolov8/weights/best.pt \
-#     --names "Full (GRL)" "NoGRL" "Freeze Full" "Freeze NoGRL" \
-#     --images $TARGET_IMAGES \
-#     --output $RESULTS_DIR/gradcam \
-#     --n-images 20 \
-#     --device $DEVICE
+python gradcam_explain.py \
+    --weights $WEIGHTS \
+    --checkpoints \
+        $RESULTS_DIR/full/weights/best.pt \
+    --names "Full (GRL)" \
+    --images $TARGET_IMAGES \
+    --data $DATA \
+    --output $RESULTS_DIR/gradcam \
+    --n-images 20 \
+    --conf-thresh 0.20 \
+    --global-heatmap \
+    --device $DEVICE
 
-# echo "✅ EigenCAM visualization complete!"
+echo "✅ EigenCAM visualization complete!"
 
 # ============================================================================
 # BƯỚC 4: DETECTION DIFF VISUALIZATION
@@ -153,22 +124,19 @@ echo "✅ Pseudo-label quality analysis complete!"
 # echo " STEP 4: Detection Diff Visualization"
 # echo "========================================"
 
-# python detection_diff.py \
-#     --weights $WEIGHTS \
-#     --checkpoints \
-#         $RESULTS_DIR/full-yolov8/weights/best.pt \
-#         $RESULTS_DIR/nogrl-yolov8/weights/best.pt \
-#         $RESULTS_DIR/freeze_teacher-yolov8/weights/best.pt \
-#         $RESULTS_DIR/freeze_teacher-nogrl-yolov8/weights/best.pt \
-#     --names "Full (GRL)" "NoGRL" "Freeze Full" "Freeze NoGRL" \
-#     --images $TARGET_IMAGES \
-#     --labels $TARGET_LABELS \
-#     --output $RESULTS_DIR/detection_diff \
-#     --n-images 20 \
-#     --best-matches \
-#     --device $DEVICE
+python detection_diff.py \
+    --weights $WEIGHTS \
+    --checkpoints \
+        $RESULTS_DIR/full/weights/best.pt \
+    --names "Full (GRL)" \
+    --images $TARGET_IMAGES \
+    --labels $TARGET_LABELS \
+    --output $RESULTS_DIR/detection_diff \
+    --n-images 20 \
+    --best-matches \
+    --device $DEVICE
 
-# echo "✅ Detection diff visualization complete!"
+echo "✅ Detection diff visualization complete!"
 
 # ============================================================================
 # SUMMARY

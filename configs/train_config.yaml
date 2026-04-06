@@ -1,6 +1,6 @@
 # Model & Data
 model:
-  weights: "yolov8l.pt"
+  weights: "yolo26s.pt"
   imgsz: 640
 
 data:

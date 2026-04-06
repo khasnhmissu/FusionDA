@@ -8,7 +8,7 @@ from argparse import Namespace
 
 @dataclass
 class ModelConfig:
-    weights: str = "yolov8l.pt"
+    weights: str = "yolo26s.pt"
     imgsz: int = 640
 
 

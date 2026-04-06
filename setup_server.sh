@@ -46,10 +46,10 @@ ls -d datasets/*/*/images/train 2>/dev/null || echo "Warning: Check folder struc
 
 # 7. Download weights
 echo ""
-echo "Downloading YOLOv8l weights..."
-wget -q https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8l.pt
+echo "Downloading YOLO26s weights..."
+wget -q https://github.com/ultralytics/assets/releases/download/v0.0.0/yolo26s.pt
 
 echo ""
 echo "=== Setup Complete ==="
 echo "Run training:"
-echo "python train.py --data data.yaml --weights yolov8l.pt --epochs 200 --batch 16 --use-grl --enable-monitoring"
+echo "python train.py --data data.yaml --weights yolo26s.pt --epochs 200 --batch 16 --use-grl --enable-monitoring"

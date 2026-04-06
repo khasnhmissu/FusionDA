@@ -3,6 +3,8 @@ FusionDA Inference Script
 =========================
 Chạy inference trên folder ảnh, xuất file .txt prediction (YOLO format).
 
+Hỗ trợ YOLO26s và YOLOv8 checkpoints.
+
 Output format mỗi dòng:
     class_id  confidence  x_center  y_center  width  height
     (tọa độ chuẩn hóa [0, 1])
@@ -147,10 +149,10 @@ def xyxy_to_xywhn(boxes_xyxy, img_w, img_h):
 
 def load_model(weights, checkpoint, device, half=False):
     """
-    Load YOLOv8 architecture + FusionDA checkpoint.
+    Load YOLO26/YOLOv8 architecture + FusionDA checkpoint.
 
     Args:
-        weights:    đường dẫn đến YOLOv8 base (e.g. 'yolov8n.pt')
+        weights:    đường dẫn đến base weights (e.g. 'yolo26s.pt')
         checkpoint: đường dẫn đến FusionDA checkpoint (.pt)
         device:     torch.device
         half:       dùng FP16
@@ -196,6 +198,7 @@ def parse_model_output(pred, device):
     """
     Parse raw model output → tensor phù hợp cho NMS.
 
+    YOLO26 output (eval mode):  tuple (tensor_decoded, None) hoặc tensor [B, N, 6]
     YOLOv8 output (train mode): dict {'one2one': ..., 'one2many': ...}
                                  hoặc tuple/list
     YOLOv8 output (eval mode):  tensor [batch, 4+nc, num_preds]
@@ -205,7 +208,7 @@ def parse_model_output(pred, device):
         - nc giá trị tiếp: class scores (objectness * class_prob)
 
     Returns:
-        pred_tensor: [batch, 4+nc, num_preds]
+        pred_tensor: [batch, 4+nc, num_preds] hoặc [batch, N, 6]
     """
     if isinstance(pred, dict):
         # Training mode output
@@ -218,6 +221,16 @@ def parse_model_output(pred, device):
         pred_tensor = pred[0]
     else:
         pred_tensor = pred
+
+    # Nếu output là E2E format [batch, num_det, 6] -> không cần transpose hay sigmoid
+    if len(pred_tensor.shape) == 3 and pred_tensor.shape[-1] == 6:
+        return pred_tensor
+
+    # YOLO26 eval: có thể trả về [B, N, 4+nc] thay vì [B, 4+nc, N]
+    if len(pred_tensor.shape) == 3:
+        if pred_tensor.shape[-1] > pred_tensor.shape[1]:
+            # [B, N, 4+nc] format → transpose sang [B, 4+nc, N]
+            pred_tensor = pred_tensor.permute(0, 2, 1)
 
     # Apply sigmoid nếu class scores chưa qua activation
     if len(pred_tensor.shape) == 3:

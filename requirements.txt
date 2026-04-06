@@ -2,7 +2,7 @@
 torch>=2.0.0
 torchvision>=0.15.0
 
-ultralytics>=8.0.0
+ultralytics>=8.4.0   # YOLO26s support requires 8.4.0+
 
 numpy>=1.23.0
 opencv-python>=4.6.0

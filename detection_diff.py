@@ -6,7 +6,7 @@ Màu: Green = TP, Red = FP, Yellow dashed = FN (missed GT).
 
 Usage:
     python detection_diff.py \
-        --weights yolov8l.pt \
+        --weights yolo26s.pt \
         --checkpoints \
             results/full-yolov8/weights/best.pt \
             results/nogrl-yolov8/weights/best.pt \
@@ -86,6 +86,14 @@ def parse_model_output(pred):
         pred_tensor = pred[0]
     else:
         pred_tensor = pred
+
+    if len(pred_tensor.shape) == 3 and pred_tensor.shape[-1] == 6:
+        return pred_tensor
+
+    # YOLO26 eval: có thể trả về [B, N, 4+nc] thay vì [B, 4+nc, N]
+    if len(pred_tensor.shape) == 3:
+        if pred_tensor.shape[-1] > pred_tensor.shape[1]:
+            pred_tensor = pred_tensor.permute(0, 2, 1)
     if len(pred_tensor.shape) == 3:
         cls_scores = pred_tensor[:, 4:, :]
         if cls_scores.max() > 1.0 or cls_scores.min() < 0.0:
@@ -465,7 +473,7 @@ def run(opt):
 def parse_args():
     parser = argparse.ArgumentParser(description='Detection Diff Visualization')
     
-    parser.add_argument('--weights', type=str, default='yolov8l.pt')
+    parser.add_argument('--weights', type=str, default='yolo26s.pt')
     parser.add_argument('--checkpoints', nargs='+', required=True)
     parser.add_argument('--names', nargs='+', required=True)
     parser.add_argument('--images', type=str, required=True, help='Target images dir')

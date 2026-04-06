@@ -1,4 +1,4 @@
-"""FDA Training - Semi-Supervised Domain Adaptive Training for YOLOv8"""
+"""FDA Training - Semi-Supervised Domain Adaptive Training for YOLO26/YOLOv8"""
 import argparse
 import gc
 import math
@@ -17,7 +17,7 @@ from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.nms import non_max_suppression
 
 from domain_adaptation import (
-    DomainDiscriminator, YOLOv8FeatureHook,
+    DomainDiscriminator, YOLOv8FeatureHook, find_last_backbone_layer,
     compute_domain_loss, get_grl_alpha, get_domain_accuracy
 )
 from fusion_da import FDALoss, WeightEMA, PairedMultiDomainDataset
@@ -91,7 +91,13 @@ def train(opt):
     LOGGER.info(colorstr('FDA: ') + f'Training with {nc} classes')
     
     # Student model
-    yolo_student = YOLO(opt.weights)
+    if getattr(opt, 'cfg', None):
+        yolo_student = YOLO(opt.cfg)
+        if opt.weights and opt.weights != 'None':
+            yolo_student.load(opt.weights)
+    else:
+        yolo_student = YOLO(opt.weights)
+        
     model_student = yolo_student.model.to(device)
     for param in model_student.parameters():
         param.requires_grad = True
@@ -121,14 +127,16 @@ def train(opt):
     
     # Always create a monitoring hook for feature collection (UMAP/MMD)
     if opt.enable_monitoring:
-        monitor_hook = YOLOv8FeatureHook(model_student, layer_idx=9)
-        LOGGER.info(f'{colorstr("Monitor:")} Feature hook for UMAP/MMD')
+        backbone_layer_idx = find_last_backbone_layer(model_student)
+        monitor_hook = YOLOv8FeatureHook(model_student, layer_idx=backbone_layer_idx)
+        LOGGER.info(f'{colorstr("Monitor:")} Feature hook for UMAP/MMD (layer {backbone_layer_idx})')
     
     if opt.use_grl:
         if monitor_hook:
             feature_hook = monitor_hook  # Reuse monitoring hook for GRL
         else:
-            feature_hook = YOLOv8FeatureHook(model_student, layer_idx=9)
+            backbone_layer_idx = find_last_backbone_layer(model_student)
+            feature_hook = YOLOv8FeatureHook(model_student, layer_idx=backbone_layer_idx)
         
         with torch.no_grad():
             test_img = torch.zeros(1, 3, opt.imgsz, opt.imgsz, device=device)
@@ -209,7 +217,12 @@ def train(opt):
     # Loss function
     class_mapping = getattr(opt, 'class_mapping', {0: 0, 1: 1, 2: 1})
     LOGGER.info(f'Class mapping: {class_mapping}')
-    compute_loss = FDALoss(model_student, class_mapping=class_mapping)
+    compute_loss = FDALoss(
+        model_student,
+        class_mapping         = class_mapping,
+        box_gain              = getattr(opt, 'box_gain', 7.5),
+        cls_gain              = getattr(opt, 'cls_gain', 0.5),
+    )
     
     # AMP
     use_amp = getattr(opt, 'amp', False) and device.type != 'cpu'
@@ -390,7 +403,7 @@ def train(opt):
                             if pred_tensor is not None:
                                 pred_tensor = pred_tensor[0] if isinstance(pred_tensor, (list, tuple)) else pred_tensor
                             else:
-                                pred_tensor = torch.zeros(1, 84, 8400, device=device)
+                                pred_tensor = torch.zeros(1, 84, 10, device=device)
                         elif isinstance(pred_teacher, (list, tuple)):
                             pred_tensor = pred_teacher[0]
                         else:
@@ -403,10 +416,16 @@ def train(opt):
                                 pred_tensor = torch.zeros_like(pred_tensor)
                         else:
                             teacher_output_valid = False
-                            pred_tensor = torch.zeros(1, 6, 8400, device=device)
+                            # Fallback tensor small length (10) since 8400 is no longer valid for P2
+                            pred_tensor = torch.zeros(1, 6, 10, device=device)
                         
-                        # Apply sigmoid if needed
+                        # YOLO26: có thể trả về [B, N, 4+nc] thay vì [B, 4+nc, N]
+                        # Cần transpose nếu cần thiết trước khi đưa vào NMS
                         if teacher_output_valid and len(pred_tensor.shape) == 3:
+                            # Nếu chiều cuối > chiều 1 thì có thể đang ở format [B, N, 4+nc]
+                            if pred_tensor.shape[-1] > pred_tensor.shape[1]:
+                                pred_tensor = pred_tensor.permute(0, 2, 1)
+                            # Apply sigmoid nếu cần
                             cls_scores = pred_tensor[:, 4:, :]
                             if cls_scores.max() > 1.0 or cls_scores.min() < 0.0:
                                 pred_tensor = torch.cat([
@@ -548,7 +567,8 @@ def train(opt):
                 continue
             
             scaler.step(optimizer)
-            if grl_optimizer_active:
+            # Conditionally step discriminator to prevent overfitting & vanishing gradients
+            if grl_optimizer_active and domain_acc < 0.85:
                 scaler.step(grl_optimizer)
             scaler.update()
             
@@ -700,7 +720,8 @@ def parse_args():
     parser.add_argument('--config', type=str, default=None, help='YAML config file')
     
     # Model
-    parser.add_argument('--weights', type=str, default='yolov8n.pt')
+    parser.add_argument('--cfg', type=str, default=None, help='custom model.yaml file (e.g. yolov8-p2.yaml)')
+    parser.add_argument('--weights', type=str, default='yolo26s.pt')
     parser.add_argument('--data', type=str, default='data_v8.yaml')
     parser.add_argument('--imgsz', type=int, default=640)
     
@@ -739,7 +760,29 @@ def parse_args():
     # Misc
     parser.add_argument('--enable-monitoring', action='store_true')
     parser.add_argument('--amp', action='store_true')
-    
+
+    # ── Small-object loss improvements ──────────────────────────────────
+    parser.add_argument(
+        '--use-small-object-loss', action='store_true',
+        help='Replace CIoU with Inner-CIoU + ScaleAware TAL for better small-object mAP'
+    )
+    parser.add_argument(
+        '--inner-ratio', type=float, default=0.7,
+        help='Auxiliary box scale for Inner-CIoU (0 < r <= 1, default 0.7)'
+    )
+    parser.add_argument(
+        '--use-wise-iou', action='store_true',
+        help='Enable WiseIoU v3 reweighting on top of Inner-CIoU'
+    )
+    parser.add_argument(
+        '--box-gain', type=float, default=7.5,
+        help='Box/IoU loss weight (default 7.5)'
+    )
+    parser.add_argument(
+        '--cls-gain', type=float, default=0.5,
+        help='Classification loss weight (default 0.5)'
+    )
+
     return parser.parse_args()
 
 
