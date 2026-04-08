@@ -63,31 +63,39 @@ class DomainAccuracyTracker:
     ):
         """
         Update accuracy with batch predictions.
-        
+
+        Handles both:
+          - [B, 1]      (GAP + MLP discriminator — correct path)
+          - [B, 1, H, W] (legacy spatial conv output — pooled to [B, 1])
+
         Args:
-            domain_pred_source: [B, 1] logits from discriminator for source (should predict 1)
-            domain_pred_target: [B, 1] logits from discriminator for target (should predict 0)
+            domain_pred_source: logits for source (should predict > 0)
+            domain_pred_target: logits for target (should predict <= 0)
         """
         if domain_pred_source is None or domain_pred_target is None:
             return
-        
+
         with torch.no_grad():
-            # Source: correct if prediction > 0 (predicts source)
-            source_pred = (domain_pred_source > 0).float().cpu()
-            source_correct = source_pred.sum().item()
-            source_total = len(source_pred)
-            
-            # Target: correct if prediction <= 0 (predicts target)
-            target_pred = (domain_pred_target <= 0).float().cpu()
-            target_correct = target_pred.sum().item()
-            target_total = len(target_pred)
-        
+            # --- Pool spatial tensors to [B, 1] to avoid counting pixels ---
+            if domain_pred_source.dim() > 2:
+                domain_pred_source = domain_pred_source.flatten(2).mean(-1, keepdim=True)
+            if domain_pred_target.dim() > 2:
+                domain_pred_target = domain_pred_target.flatten(2).mean(-1, keepdim=True)
+
+            # Source: correct if logit > 0  (predicts "source")
+            source_correct = (domain_pred_source > 0).float().sum().item()
+            source_total = domain_pred_source.numel()   # = B (after pooling)
+
+            # Target: correct if logit <= 0  (predicts "target")
+            target_correct = (domain_pred_target <= 0).float().sum().item()
+            target_total = domain_pred_target.numel()   # = B
+
         # Update running stats
         self._source_correct.append(source_correct)
         self._target_correct.append(target_correct)
         self._total_source.append(source_total)
         self._total_target.append(target_total)
-        
+
         # Track for epoch averaging
         self._current_epoch_source.append((source_correct, source_total))
         self._current_epoch_target.append((target_correct, target_total))

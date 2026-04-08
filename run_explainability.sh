@@ -50,6 +50,7 @@ python train.py \
     --batch $BATCH \
     --device $DEVICE \
     --use-grl \
+    --use-multiscale-grl \
     --enable-monitoring \
     --project $RESULTS_DIR \
     --name full

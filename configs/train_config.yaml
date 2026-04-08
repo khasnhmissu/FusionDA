@@ -46,14 +46,17 @@ distillation:
 
 # Domain Adversarial (GRL)
 # Gradient Reversal Layer aligns source/target feature distributions
+# Architecture: GAP + MLP discriminator (SOTA, stable gradients)
+# use_multiscale: hook P3+P4+P5 for better alignment (~15% more compute)
 grl:
   enabled: true
-  warmup_epochs: 10
-  max_alpha: 0.3
-  weight: 0.05
-  hidden_dim: 256
-  dropout: 0.3
-  lr: 0.0001
+  use_multiscale: false          # set true for SOTA multi-scale (P3+P4+P5)
+  warmup_epochs: 20              # epochs before GRL activates (higher = safer)
+  max_alpha: 1.0                 # max GRL reversal strength (0.3 was too weak → discriminator always won)
+  weight: 0.05                   # domain loss weight (0.02 was too small → GRL signal overwhelmed by det loss)
+  hidden_dim: 512                # discriminator MLP hidden size
+  dropout: 0.1                   # reduced from 0.3 → discriminator learns consistently (not randomly)
+  lr: 0.00005                    # slow discriminator lr so backbone GRL has a fighting chance
 
 # Output
 output:

@@ -215,8 +215,9 @@ def parse_model_output(pred, device):
         pred_tensor: [batch, 4+nc, num_preds]
     """
     if isinstance(pred, dict):
-        # Training mode output
-        pred_tensor = pred.get('one2one', pred.get('one2many', None))
+        # Training mode output (dict)
+        # NMS cần output của nhánh dense features, nên ta lấy one2many
+        pred_tensor = pred.get('one2many', pred.get('one2one', None))
         if pred_tensor is not None:
             pred_tensor = pred_tensor[0] if isinstance(pred_tensor, (list, tuple)) else pred_tensor
         else:
@@ -229,9 +230,10 @@ def parse_model_output(pred, device):
     if len(pred_tensor.shape) == 3 and pred_tensor.shape[-1] == 6:
         return pred_tensor
 
-    # YOLO26 eval: có thể trả về [B, N, 4+nc] thay vì [B, 4+nc, N]
+    # Chuẩn bị Tensor cho NMS Ultralytics, yêu cầu format là [B, 4+nc, N]
+    # Ví dụ: YOLO26/v10 có thể trả về dạng [B, N, 4+nc] -> [1, 8400, 84] -> cần transpose (N > 4+nc <=> shape[1] > shape[-1])
     if len(pred_tensor.shape) == 3:
-        if pred_tensor.shape[-1] > pred_tensor.shape[1]:
+        if pred_tensor.shape[1] > pred_tensor.shape[-1]:
             # [B, N, 4+nc] format → transpose sang [B, 4+nc, N]
             pred_tensor = pred_tensor.permute(0, 2, 1)
 
