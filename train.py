@@ -1,9 +1,60 @@
-"""FDA Training - Semi-Supervised Domain Adaptive Training for YOLO26/YOLOv8"""
+"""FDA Training - Semi-Supervised Domain Adaptive Training for YOLO26/YOLOv8
+
+Pipeline Summary
+=================
+Forward passes (per iteration):
+  1. student(source_real)      → loss_source      (detection with GT)
+  2. student(source_fake)      → loss_source_fake  (detection with GT)
+  3. student(target_real)      → loss_distillation (detection with pseudo-labels)
+  4. teacher(target_real)      → pseudo-labels                       [no_grad]
+  4b.teacher(target_fake)      → teacher features for Feature KD     [no_grad, only if --use-feature-distill]
+
+  Note: the teacher ingests the SAME augmented target_real tensor the student
+  saw. Running teacher on target_fake for pseudo-labels used to mis-align
+  boxes because mosaic/flip were sampled independently per YOLODataset.
+
+Feature hooks (on student backbone):
+  - student_backbone_hook: captures features after EACH forward
+    → saved immediately as feat_sr, feat_sf, feat_tr
+
+Feature hooks (on teacher backbone):
+  - teacher_backbone_hook: captures features from teacher(target_fake)
+    → saved as feat_teacher_tf  [no_grad, detached]
+
+Losses:
+  loss_source      = detection(pred_source, GT)
+  loss_source_fake = detection(pred_source_fake, GT)
+  loss_consistency = cosine_distance(feat_sf, feat_sr.detach())
+  loss_distillation = detection(pred_target_real, pseudo_labels_from_teacher)
+  loss_feature_kd  = cosine_distance(feat_tr, feat_teacher_tf.detach())
+  loss_domain      = GRL(discriminator(feat_sr), discriminator(feat_tr))
+
+Gradient flow:
+  loss_source      → student backbone (normal)
+  loss_source_fake → student backbone (normal)
+  loss_consistency → student backbone via source_fake path only (sr detached)
+  loss_distillation→ student backbone (normal, pseudo-labels are detached targets)
+  loss_feature_kd  → student backbone via target_real path only (teacher detached)
+  loss_domain      → student backbone REVERSED via GRL (adversarial)
+                   → discriminator NORMAL (learns to classify domains)
+
+No double-gradient: each feature tensor feeds into at most ONE loss with gradient.
+  feat_sr:  → GRL (with reversed gradient) + detached in consistency
+  feat_sf:  → consistency (gradient flows normally)
+  feat_tr:  → GRL (with reversed gradient) + feature_kd (gradient flows normally)
+  
+Note on feat_tr dual use: GRL reverses gradient to make features domain-invariant,
+while feature_kd pulls student features toward teacher. Both operate on the same
+tensor but PyTorch autograd handles multiple consumers correctly — gradients are
+summed, not conflicted, because both objectives want the student to produce
+target features that are (a) domain-invariant and (b) similar to teacher's view.
+"""
 import argparse
 import gc
 import math
 import time
 import yaml
+from collections import defaultdict
 from pathlib import Path
 from tqdm import tqdm
 import torch
@@ -24,14 +75,77 @@ from domain_adaptation import (
 )
 from fusion_da import FDALoss, WeightEMA, PairedMultiDomainDataset
 from utils.FDA_helpers import (
-    get_adaptive_conf_thres,
     filter_pseudo_labels_by_uncertainty,
     get_progressive_lambda,
 )
+
+# Fixed teacher confidence threshold (no adaptive schedule)
+# Burn-in already prevents early noisy pseudo-labels,
+# so a fixed threshold is simpler and more predictable.
+TEACHER_CONF_THRES = 0.5
 from utils.training_logger import TrainingLogger
 from utils.domain_monitor import DomainMonitor
 import cv2
 import numpy as np
+
+
+def _freeze_bn(model):
+    """Freeze BatchNorm running stats — prevent contamination from non-source domains."""
+    for m in model.modules():
+        if isinstance(m, (torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm, torch.nn.BatchNorm1d)):
+            m.eval()
+
+
+def _unfreeze_bn(model):
+    """Resume BatchNorm running stat updates."""
+    for m in model.modules():
+        if isinstance(m, (torch.nn.BatchNorm2d, torch.nn.SyncBatchNorm, torch.nn.BatchNorm1d)):
+            m.train()
+
+
+def validate_model(
+    tag: str,
+    state_dict,
+    weights_path: str,
+    data_yaml: str,
+    split: str,
+    device,
+    dataset_label: str = None,
+):
+    """Run Ultralytics val() on an arbitrary state_dict and log who/what is being evaluated.
+
+    tag           — human label (e.g. 'STUDENT', 'TEACHER').
+    weights_path  — path to the .pt file used to rebuild a fresh YOLO wrapper.
+    data_yaml     — yaml to pass to .val().
+    split         — 'test' / 'val' / 'train'.
+    dataset_label — extra human description (e.g. 'target_real' or 'source_real').
+    """
+    label = dataset_label or data_yaml
+    LOGGER.info(f'[VAL] ▶ Evaluating {tag} on {label} (split={split}, yaml={data_yaml})')
+    val_yolo = YOLO(weights_path)
+    val_model = val_yolo.model.to(device)
+    val_model.load_state_dict(state_dict)
+    val_model.eval()
+    val_yolo.model = val_model
+    try:
+        metrics = val_yolo.val(data=data_yaml, split=split, verbose=False)
+        LOGGER.info(
+            f'[VAL] ✓ {tag} on {label}: '
+            f'mAP50={metrics.box.map50:.4f}, mAP50-95={metrics.box.map:.4f}, '
+            f'P={metrics.box.mp:.4f}, R={metrics.box.mr:.4f}'
+        )
+        # Per-class breakdown when mAP is low — helps spot class-index mis-alignment
+        try:
+            if metrics.box.map50 < 0.1 and hasattr(metrics.box, 'maps'):
+                per_class = metrics.box.maps
+                LOGGER.info(f'[VAL]   per-class mAP50-95: {[f"{m:.3f}" for m in per_class]}')
+        except Exception:
+            pass
+        return metrics
+    finally:
+        del val_model, val_yolo
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def save_debug_image(img_tensor, pseudo_labels, save_path, names, conf_thres=0.5):
@@ -113,38 +227,36 @@ def train(opt):
         alpha=opt.teacher_alpha,
         freeze_teacher=getattr(opt, 'freeze_teacher', False),
         device=device,
-        update_after_step=getattr(opt, 'update_after_step', 2000),
-        alpha_rampup_steps=getattr(opt, 'alpha_rampup_steps', 5000),
+        update_after_step=getattr(opt, 'update_after_step', 500),
+        alpha_rampup_steps=getattr(opt, 'alpha_rampup_steps', 2000),
     )
     model_teacher = teacher_ema.module
     
     LOGGER.info(f'Student params: {sum(p.numel() for p in model_student.parameters()):,}')
     LOGGER.info(f'Teacher params: {sum(p.numel() for p in model_teacher.parameters()):,}')
     
-    # ── Feature MSE Distillation hook (Teacher backbone end, độc lập với GRL) ──
-    teacher_feature_hook = None
-    if getattr(opt, 'use_feature_distill', False):
-        teacher_backbone_idx = find_last_backbone_layer(model_teacher)
-        teacher_feature_hook = YOLOv8FeatureHook(model_teacher, layer_idx=teacher_backbone_idx)
-        LOGGER.info(
-            f'{colorstr("FeatureDistill:")} Teacher hook tại layer {teacher_backbone_idx} '
-            f'(lambda_feature={getattr(opt, "lambda_feature", 0.05)})'
-        )
+    # ══════════════════════════════════════════════════════════════════════
+    # HOOK SETUP — Unified, no overlap
+    # ══════════════════════════════════════════════════════════════════════
+    # ONE hook on student backbone → captures features after each forward
+    # ONE hook on teacher backbone → captures features from teacher(target_fake)
+    # Multi-scale hooks ONLY if multi-scale GRL is enabled
+    # ══════════════════════════════════════════════════════════════════════
+    
+    student_backbone_idx = find_last_backbone_layer(model_student)
+    student_backbone_hook = YOLOv8FeatureHook(model_student, layer_idx=student_backbone_idx)
+    LOGGER.info(f'{colorstr("Hooks:")} Student backbone hook at layer {student_backbone_idx}')
+    
+    teacher_backbone_idx = find_last_backbone_layer(model_teacher)
+    teacher_backbone_hook = YOLOv8FeatureHook(model_teacher, layer_idx=teacher_backbone_idx)
+    LOGGER.info(f'{colorstr("Hooks:")} Teacher backbone hook at layer {teacher_backbone_idx}')
     
     # ── GRL / Domain-Adaptation setup ────────────────────────────────────
     domain_discriminator = None   # single-scale  DomainDiscriminator
-    ms_discriminator    = None    # multi-scale   MultiScaleDomainDiscriminator
-    feature_hook        = None    # single-scale  YOLOv8FeatureHook
-    ms_feature_hook     = None    # multi-scale   MultiScaleFeatureHook
+    ms_discriminator    = None    # multi-scale   MultiScaleFusedDiscriminator
+    ms_feature_hook     = None    # multi-scale   MultiScaleFeatureHook (ONLY for GRL)
     grl_optimizer       = None
-    monitor_hook        = None    # monitoring-only hook (UMAP/MMD)
     use_multiscale_grl  = getattr(opt, 'use_multiscale_grl', False)
-
-    # Always create a monitoring hook for feature collection (UMAP/MMD)
-    if opt.enable_monitoring:
-        backbone_layer_idx = find_last_backbone_layer(model_student)
-        monitor_hook = YOLOv8FeatureHook(model_student, layer_idx=backbone_layer_idx)
-        LOGGER.info(f'{colorstr("Monitor:")} Feature hook for UMAP/MMD (layer {backbone_layer_idx})')
 
     if opt.use_grl:
         with torch.no_grad():
@@ -160,17 +272,14 @@ def train(opt):
             # Probe channel sizes
             with torch.no_grad():
                 _ = model_student(test_img)
+                # Drain the single-scale hook too (avoid stale features)
+                _ = student_backbone_hook.get_features()
                 probe_feats = ms_feature_hook.get_features()
                 in_ch_list = [
                     f.shape[1] if f is not None else 256
                     for f in probe_feats
                 ]
             LOGGER.info(f'{colorstr("GRL [multi-scale]:")} in_channels per scale = {in_ch_list}')
-            LOGGER.info(
-                f'{colorstr("GRL [multi-scale]:")} P3=layer{ms_layer_indices[0]}, '
-                f'P4=layer{ms_layer_indices[1]}, P5=layer{ms_layer_indices[2]} '
-                f'(PAN outputs — post-FPN fusion)'
-            )
 
             ms_discriminator = MultiScaleFusedDiscriminator(
                 in_channels_list=in_ch_list,
@@ -183,15 +292,9 @@ def train(opt):
             )
         else:
             # ── Single-scale discriminator  (backbone end) ─────────────────
-            if monitor_hook:
-                feature_hook = monitor_hook   # reuse monitoring hook
-            else:
-                backbone_layer_idx = find_last_backbone_layer(model_student)
-                feature_hook = YOLOv8FeatureHook(model_student, layer_idx=backbone_layer_idx)
-
             with torch.no_grad():
                 _ = model_student(test_img)
-                test_feat = feature_hook.get_features()
+                test_feat = student_backbone_hook.get_features()
                 in_channels = test_feat.shape[1] if test_feat is not None else 256
 
             domain_discriminator = DomainDiscriminator(
@@ -206,13 +309,21 @@ def train(opt):
             LOGGER.info(f'{colorstr("GRL [single-scale]:")} in_channels={in_channels}')
     
     # Checkpoint epochs for pseudo-label quality analysis
-    checkpoint_epochs = set(getattr(opt, 'checkpoint_epochs', [0, 50, 100, 150]))
+    checkpoint_epochs = set(getattr(opt, 'checkpoint_epochs', [10, 20, 30]))
     checkpoint_epochs.add(opt.epochs - 1)  # Always save final
     LOGGER.info(f'Saving intermediate checkpoints at epochs: {sorted(checkpoint_epochs)}')
     
     # Optimizer & Scheduler
     optimizer = optim.AdamW(model_student.parameters(), lr=opt.lr0, weight_decay=0.0005)
-    lf = lambda x: ((1 - math.cos(x * math.pi / opt.epochs)) / 2) * (opt.lrf - 1) + 1
+    # Warmup + cosine decay: prevents LR from collapsing too early
+    # Old pure cosine dropped LR to 1e-6 by epoch 19/100 → model couldn't learn
+    warmup_epochs_lr = 5
+    def lf(x):
+        if x < warmup_epochs_lr:
+            return (x + 1) / warmup_epochs_lr  # Linear warmup: 0.2 → 1.0
+        # Cosine decay from 1.0 to lrf over remaining epochs
+        progress = (x - warmup_epochs_lr) / max(opt.epochs - warmup_epochs_lr, 1)
+        return opt.lrf + (1.0 - opt.lrf) * (1 + math.cos(math.pi * progress)) / 2
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     
     # Data paths
@@ -248,10 +359,13 @@ def train(opt):
         target_real_path=target_real[0] if target_real else None,
         target_fake_path=target_fake[0] if target_fake else None,
         imgsz=opt.imgsz,
-        augment=False,
+        augment=True,  # Was False → caused overfitting without regularization
         hyp=default_cfg,
         data=data_dict,
         stride=gs,
+        copy_paste_small=getattr(opt, 'use_copy_paste_small', False),
+        copy_paste_max_copies=getattr(opt, 'copy_paste_max_copies', 3),
+        copy_paste_small_thr=getattr(opt, 'copy_paste_small_thr', 32.0),
     )
     
     paired_loader = DataLoader(
@@ -274,6 +388,9 @@ def train(opt):
         class_mapping         = class_mapping,
         box_gain              = getattr(opt, 'box_gain', 7.5),
         cls_gain              = getattr(opt, 'cls_gain', 0.5),
+        use_small_object_loss = getattr(opt, 'use_small_object_loss', False),
+        inner_ratio           = getattr(opt, 'inner_ratio', 0.7),
+        use_wise_iou          = getattr(opt, 'use_wise_iou', False),
     )
     
     # AMP
@@ -317,18 +434,81 @@ def train(opt):
         domain_monitor.set_total_epochs(opt.epochs)
         LOGGER.info(f'{colorstr("DomainMonitor:")} UMAP at epochs {umap_epochs}')
     
-    # Training loop
+    # ══════════════════════════════════════════════════════════════════════
+    # TRAINING LOOP
+    # ══════════════════════════════════════════════════════════════════════
     LOGGER.info(f'\n{colorstr("Starting training:")} {opt.epochs} epochs...\n')
+    
+    # ── Baseline mode: pure detection, no DA ───────────────────────────
+    baseline_mode = getattr(opt, 'baseline', False)
+    if baseline_mode:
+        LOGGER.info(colorstr('\n🔬 BASELINE MODE: ') + 'Pure YOLO detection on source_real (no DA)')
+        LOGGER.info(colorstr('Pipeline: ') + 'loss = L_src (detection only)')
+        LOGGER.info('  All DA disabled: no teacher, no GRL, no consistency, no distillation')
+        LOGGER.info('  Validation: source_real + target_real (dual-domain mAP)')
+    else:
+        LOGGER.info(colorstr('Pipeline: ') + 'loss = L_src + L_src_fake + λ·L_distill + λ_feat·L_feat_kd + β·L_consistency + L_domain')
+        LOGGER.info(f'  L_src / L_src_fake:  Detection loss on source_real/fake with GT labels')
+        LOGGER.info(f'  L_distill:           Pseudo-label detection loss (teacher→student)')
+        LOGGER.info(f'  L_feat_kd:           Feature KD: student(target_real) ↔ teacher(target_fake)')
+        LOGGER.info(f'  L_consistency:       Feature consistency: student(source_real) ↔ student(source_fake)')
+        LOGGER.info(f'  L_domain:            GRL domain adversarial loss (source_real ↔ target_real)')
+        LOGGER.info(colorstr('BN Protection: ') + 'BatchNorm frozen during source_fake + target_real forwards (only source_real updates BN stats)')
     
     best_fitness = 0.0
     t0 = time.time()
     global_step = 0
     burn_in_epochs = getattr(opt, 'burn_in_epochs', 10)
     source_loss_baseline = None  # Track source loss baseline for teacher validation
+    teacher_map_baseline = None  # Track teacher mAP baseline for quality gating
     prev_domain_acc = 0.5        # Track domain accuracy across iterations for adaptive GRL weight
     
+    # ── Teacher best-state checkpoint ──────────────────────────────────
+    # Save teacher when it has best target mAP.
+    # If teacher degrades beyond 50% of best, RESTORE from checkpoint.
+    # This breaks the collapse feedback loop:
+    #   student source-specializes → teacher EMA follows → teacher loses target → bad pseudo-labels
+    best_teacher_map50 = 0.0
+    best_teacher_state = None
+    teacher_quality_ok = False  # Only True after teacher passes min quality gate (mAP@50 >= 0.25)
+
+    # ── Best student-state checkpoint (parity with teacher safeguard) ──
+    best_student_map50 = 0.0
+    best_student_state = None
+
+    # ── Epoch-0 baseline validation ────────────────────────────────────
+    # Run BEFORE any training so we can tell whether the student genuinely
+    # degrades or whether the initial weights already score low on this dataset.
+    try:
+        LOGGER.info('\n===== BASELINE VALIDATION (before training) =====')
+        _ = validate_model(
+            tag='STUDENT-INIT', state_dict=model_student.state_dict(),
+            weights_path=opt.weights, data_yaml=opt.data, split='test',
+            device=device, dataset_label='target_real (test split)',
+        )
+        if not baseline_mode:
+            _ = validate_model(
+                tag='TEACHER-INIT', state_dict=model_teacher.state_dict(),
+                weights_path=opt.weights, data_yaml=opt.data, split='test',
+                device=device, dataset_label='target_real (test split)',
+            )
+        if getattr(opt, 'eval_source', False) or baseline_mode:
+            _ = validate_model(
+                tag='STUDENT-INIT', state_dict=model_student.state_dict(),
+                weights_path=opt.weights, data_yaml='data_clear.yaml', split='test',
+                device=device, dataset_label='source_real (data_clear.yaml)',
+            )
+    except Exception as e:
+        LOGGER.warning(f'[BASELINE] validation skipped: {e}')
+
     for epoch in range(opt.epochs):
         model_student.train()
+        # CRITICAL: Freeze BN for ALL forwards (including source_real).
+        # With batch=4, BN momentum=0.1 causes running_mean/var to be dominated
+        # by the last ~10 noisy batches. At validation (eval mode), these corrupted
+        # running stats produce wrong normalization → mAP collapses on ALL domains.
+        # Keeping pretrained COCO BN stats fixes this (conv/linear weights still train).
+        _freeze_bn(model_student)
         model_teacher.eval()
         
         if opt.use_grl:
@@ -338,10 +518,18 @@ def train(opt):
                 domain_discriminator.train()
             current_grl_alpha = get_grl_alpha(epoch, opt.epochs, opt.grl_warmup, opt.grl_max_alpha)
         
-        if opt.use_progressive_lambda:
-            current_lambda = get_progressive_lambda(epoch, opt.epochs, opt.warmup_epochs, 0.0, opt.lambda_weight)
+        # Always ramp lambda progressively after burn-in (prevents distillation shock)
+        # Cosine schedule: lambda_min → lambda_weight over ramp_epochs after burn-in
+        # lambda_min > 0 ensures distillation is immediately active (prevents source overfit)
+        lambda_min = 0.02
+        if epoch < burn_in_epochs:
+            current_lambda = 0.0
         else:
-            current_lambda = opt.lambda_weight
+            ramp_epochs = min(5, (opt.epochs - burn_in_epochs) // 3)
+            progress = min((epoch - burn_in_epochs) / max(ramp_epochs, 1), 1.0)
+            current_lambda = lambda_min + (opt.lambda_weight - lambda_min) * (1 - math.cos(math.pi * progress)) / 2
+            if epoch == burn_in_epochs:
+                LOGGER.info(f'[LAMBDA] Distillation ramp: {lambda_min} → {opt.lambda_weight} over {ramp_epochs} epochs (cosine)')
         
         mloss = torch.zeros(5, device=device)
         paired_iter = iter(paired_loader)
@@ -355,7 +543,7 @@ def train(opt):
                 paired_iter = iter(paired_loader)
                 batch = next(paired_iter)
             
-            # Load all 4 domains
+            # ── Load all 4 domain images ──────────────────────────────────
             imgs_source = batch['source_real']['img'].to(device).float() / 255.0
             imgs_source_fake = batch['source_fake']['img'].to(device).float() / 255.0
             imgs_target = batch['target_real']['img'].to(device).float() / 255.0
@@ -367,102 +555,112 @@ def train(opt):
             imgs_target = imgs_target.clamp(0, 1)
             imgs_target_fake = imgs_target_fake.clamp(0, 1)
             
-            # Init multi-scale feature placeholders (avoids NameError before warmup)
-            ms_src_feats      = [None] * (len(ms_feature_hook.hooks) if ms_feature_hook else 0)
-            ms_src_fake_feats = [None] * (len(ms_feature_hook.hooks) if ms_feature_hook else 0)
-            ms_tgt_feats      = [None] * (len(ms_feature_hook.hooks) if ms_feature_hook else 0)
-            
-            # Feature MSE distillation placeholder
-            teacher_feat_for_mse = None
+            # Init multi-scale feature placeholders
+            ms_src_feats = [None] * (len(ms_feature_hook.hooks) if ms_feature_hook else 0)
+            ms_tgt_feats = [None] * (len(ms_feature_hook.hooks) if ms_feature_hook else 0)
 
+            # ══════════════════════════════════════════════════════════
+            # BASELINE MODE: Pure detection — only source_real + GT
+            # ══════════════════════════════════════════════════════════
+            if baseline_mode:
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    pred_source = model_student(imgs_source)
+                    loss, loss_items_source = compute_loss(pred_source, batch_source)
+                    loss = loss.sum() if loss.numel() > 1 else loss
+                    _ = student_backbone_hook.get_features()  # drain hook
+                
+                if torch.isnan(loss) or torch.isinf(loss):
+                    optimizer.zero_grad()
+                    continue
+                
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model_student.parameters(), max_norm=2.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                
+                # Logging
+                if isinstance(loss_items_source, (list, tuple)) and len(loss_items_source) >= 3:
+                    items = torch.tensor([loss_items_source[j].item() for j in range(min(3, len(loss_items_source)))])
+                else:
+                    items = torch.tensor([loss.item(), 0.0, 0.0])
+                mloss = (mloss[:3] * i + items.to(device)) / (i + 1)
+                
+                mem = f'{torch.cuda.memory_reserved() / 1e9:.1f}G' if torch.cuda.is_available() else 'CPU'
+                pbar.set_postfix({'mem': mem, 'box': f'{mloss[0]:.4f}', 'cls': f'{mloss[1]:.4f}', 'dfl': f'{mloss[2]:.4f}'})
+                continue  # Skip all DA code below
+            
             with torch.amp.autocast('cuda', enabled=use_amp):
-                # Source forward
+                # ══════════════════════════════════════════════════════════
+                # FORWARD PASS #1: student(source_real)
+                # Purpose: Detection loss (GT) + features for GRL + consistency
+                # ══════════════════════════════════════════════════════════
                 pred_source = model_student(imgs_source)
                 loss_source, loss_items_source = compute_loss(pred_source, batch_source)
-
-                # ── Collect source features ────────────────────────────────
-                source_features = None
+                
+                # Capture student backbone features IMMEDIATELY
+                feat_sr = student_backbone_hook.get_features()  # [B, C, H, W]
                 if use_multiscale_grl and ms_feature_hook:
                     ms_src_feats = ms_feature_hook.get_features()
-                elif feature_hook:
-                    source_features = feature_hook.get_features()
-                elif monitor_hook:
-                    source_features = monitor_hook.get_features()
 
-                # Source-fake forward
-                pred_source_fake = model_student(imgs_source_fake)
-                loss_source_fake, _ = compute_loss(pred_source_fake, batch_source)
+                # ══════════════════════════════════════════════════════════
+                # FORWARD PASS #2: student(source_fake)
+                # Purpose: Detection loss (GT) + features for consistency
+                # BN FROZEN: CycleGAN images must NOT pollute BN running stats
+                # SKIP if source_fake_weight is 0 (saves compute + eliminates noise)
+                # ══════════════════════════════════════════════════════════
+                sf_base_weight = getattr(opt, 'source_fake_weight', 0.1)
+                if sf_base_weight > 0:
+                    # BN already frozen globally (see epoch init above)
+                    pred_source_fake = model_student(imgs_source_fake)
+                    # FIX: use source_fake's OWN labels (aligned with its own
+                    # mosaic/flip augmentation). Using batch_source here made
+                    # labels and image come from two independent
+                    # augmentation draws → box↔image pixel mismatch → loss
+                    # exploded 3-4× and gradients pushed the student to
+                    # predict boxes in the wrong place, crashing target mAP.
+                    loss_source_fake, _ = compute_loss(pred_source_fake, batch['source_fake'])
+                    
+                    # Capture features IMMEDIATELY (hook is overwritten each forward)
+                    feat_sf = student_backbone_hook.get_features()  # [B, C, H, W]
+                    # Note: multi-scale hooks NOT needed for source_fake (GRL only uses src + tgt)
+                    if use_multiscale_grl and ms_feature_hook:
+                        _ = ms_feature_hook.get_features()  # drain to avoid stale data
+                else:
+                    loss_source_fake = torch.tensor(0.0, device=device, requires_grad=False)
+                    feat_sf = None
 
-                source_fake_features = None
-                if use_multiscale_grl and ms_feature_hook:
-                    ms_src_fake_feats = ms_feature_hook.get_features()
-                elif feature_hook:
-                    source_fake_features = feature_hook.get_features()
-                elif monitor_hook:
-                    source_fake_features = monitor_hook.get_features()
-
-                # Target forward
-                pred_target = model_student(imgs_target)
-
-                target_features = None
-                if use_multiscale_grl and ms_feature_hook:
-                    ms_tgt_feats = ms_feature_hook.get_features()
-                elif feature_hook:
-                    target_features = feature_hook.get_features()
-                elif monitor_hook:
-                    target_features = monitor_hook.get_features()
-
-                # ── Domain adversarial loss (GRL) ─────────────────────────
-                loss_domain = torch.tensor(0.0, device=device, requires_grad=False)
-                domain_acc  = 0.0
-
-                if opt.use_grl and epoch >= opt.grl_warmup:
-                    # Use prev iteration's domain_acc to decide GRL weight boost.
-                    # (domain_acc is reset to 0.0 each step before being computed below,
-                    #  so we must look at the previous iteration's value.)
-                    effective_grl_weight = opt.grl_weight
-                    if prev_domain_acc > 0.75:
-                        # Discriminator winning: boost GRL adversarial signal.
-                        # Trigger at 0.75 (earlier than 0.85) so backbone gets
-                        # pushed before discriminator fully dominates.
-                        boost = 1.0 + 2.0 * (prev_domain_acc - 0.75) / 0.25
-                        effective_grl_weight = min(opt.grl_weight * boost, opt.grl_weight * 3.0)
-
-                    if use_multiscale_grl and ms_discriminator is not None:
-                        # ── Multi-scale fused path  (MF-DANN) ─────────────────
-                        # MultiScaleFusedDiscriminator: GAP each backbone scale →
-                        # concat → ONE shared MLP → [B, 1] scalar.
-                        # Backbone only needs to fool a single discriminator
-                        # → domain confusion is achievable, domain_acc → ~0.5.
-                        if ms_feature_hook.all_available(ms_src_feats) and \
-                           ms_feature_hook.all_available(ms_tgt_feats):
-                            ms_discriminator.set_alpha(current_grl_alpha)
-                            fused_src_logit = ms_discriminator(ms_src_feats, current_grl_alpha)  # [B,1]
-                            fused_tgt_logit = ms_discriminator(ms_tgt_feats, current_grl_alpha)  # [B,1]
-                            # Single unified loss — no / n_scales needed (fused output is already scalar)
-                            loss_domain = compute_domain_loss(
-                                fused_src_logit, fused_tgt_logit
-                            ) * effective_grl_weight
-                            domain_acc = get_domain_accuracy(fused_src_logit, fused_tgt_logit)
-                            if domain_monitor:
-                                domain_monitor.update_domain_accuracy(
-                                    fused_src_logit, fused_tgt_logit, epoch, i
-                                )
-                    else:
-                        # Single-scale path
-                        if source_features is not None and target_features is not None:
-                            domain_pred_source = domain_discriminator(source_features, current_grl_alpha)
-                            domain_pred_target = domain_discriminator(target_features, current_grl_alpha)
-                            loss_domain = compute_domain_loss(
-                                domain_pred_source, domain_pred_target
-                            ) * effective_grl_weight
-                            domain_acc = get_domain_accuracy(domain_pred_source, domain_pred_target)
-                            if domain_monitor:
-                                domain_monitor.update_domain_accuracy(
-                                    domain_pred_source, domain_pred_target, epoch, i
-                                )
+                # ══════════════════════════════════════════════════════════
+                # FORWARD PASS #3: student(target_real)
+                # Purpose: Distillation loss (pseudo-labels) + features for KD + GRL
+                # CONDITIONAL: Skip entirely if neither GRL nor distillation is active
+                #   → saves compute AND avoids any residual BN/gradient contamination
+                # BN FROZEN: target domain stats must NOT pollute source-trained BN
+                # ══════════════════════════════════════════════════════════
+                need_target_forward = (
+                    epoch >= burn_in_epochs  # distillation / feature KD active
+                    or (opt.use_grl and epoch >= opt.grl_warmup)  # GRL needs target feats
+                )
                 
-                # ── Burn-in check: no pseudo labels during early epochs ──
+                if need_target_forward:
+                    # BN already frozen globally (see epoch init above)
+                    pred_target = model_student(imgs_target)
+                    
+                    # Capture features IMMEDIATELY
+                    feat_tr = student_backbone_hook.get_features()  # [B, C, H, W]
+                    if use_multiscale_grl and ms_feature_hook:
+                        ms_tgt_feats = ms_feature_hook.get_features()
+                else:
+                    pred_target = None
+                    feat_tr = None
+                    if i == 0 and epoch == 0:
+                        LOGGER.info('[BN-SAFE] Skipping target forward — no GRL/distillation active yet')
+
+                # ══════════════════════════════════════════════════════════
+                # FORWARD PASS #4: teacher(target_fake) — NO GRADIENT
+                # Purpose: Generate pseudo-labels + teacher features for KD
+                # ══════════════════════════════════════════════════════════
                 img_h, img_w = imgs_target.shape[2:]
                 
                 if epoch < burn_in_epochs:
@@ -471,98 +669,261 @@ def train(opt):
                     pseudo_labels = [torch.zeros(0, 6, device=device)
                                      for _ in range(imgs_target.shape[0])]
                     n_pseudo = 0
-                    adaptive_conf = 1.0  # For logging
+                    feat_teacher_tf = None  # No feature KD during burn-in
                     
                     if i == 0 and epoch == 0:
                         LOGGER.info(f'[BURN-IN] No pseudo labels for first {burn_in_epochs} epochs')
                 else:
-                    # ── Self-validation gating (every 5 epochs, first batch) ──
-                    # Check if teacher still produces reasonable output on source
+                    # Self-validation gating (every 5 epochs, first batch)
                     if epoch % 5 == 0 and i == 0:
                         with torch.no_grad():
                             teacher_pred_source = model_teacher(imgs_source)
+                            _ = teacher_backbone_hook.get_features()  # drain
                             teacher_source_loss, _ = compute_loss(teacher_pred_source, batch_source)
                             teacher_source_loss_val = teacher_source_loss.item() if isinstance(teacher_source_loss, torch.Tensor) else teacher_source_loss
-                            
-                            if source_loss_baseline is None:
-                                source_loss_baseline = teacher_source_loss_val
-                                LOGGER.info(f'[GATE] Teacher source loss baseline: {source_loss_baseline:.4f}')
-                            elif source_loss_baseline > 0 and teacher_source_loss_val > source_loss_baseline * 2.0:
+                        
+                        # ── Teacher mAP evaluation (on target test set) ──────
+                        teacher_map50_gate = None
+                        try:
+                            metrics_teacher = validate_model(
+                                tag='TEACHER-GATE',
+                                state_dict=model_teacher.state_dict(),
+                                weights_path=opt.weights,
+                                data_yaml=opt.data, split='test', device=device,
+                                dataset_label='target_real (in-training gate)',
+                            )
+                            teacher_map50_gate = metrics_teacher.box.map50
+                            teacher_map_gate = metrics_teacher.box.map
+
+                            logger.log_iteration(epoch, i, {}, extra={
+                                'teacher_mAP50': teacher_map50_gate,
+                                'teacher_mAP50-95': teacher_map_gate,
+                                'teacher_precision': metrics_teacher.box.mp,
+                                'teacher_recall': metrics_teacher.box.mr,
+                            }, global_step=global_step)
+                        except Exception as e:
+                            LOGGER.warning(f'[GATE] Teacher mAP evaluation failed: {e}')
+                        
+                        # ── Gating decisions (loss + mAP) ────────────────────
+                        gate_pause = False
+                        
+                        if source_loss_baseline is None:
+                            source_loss_baseline = teacher_source_loss_val
+                            LOGGER.info(f'[GATE] Teacher source loss baseline: {source_loss_baseline:.4f}')
+                        elif source_loss_baseline > 0 and teacher_source_loss_val > source_loss_baseline * 2.0:
+                            LOGGER.warning(
+                                f'[GATE] Teacher degraded (loss)! '
+                                f'{teacher_source_loss_val:.4f} > 2x baseline {source_loss_baseline:.4f}'
+                            )
+                            gate_pause = True
+                        
+                        if teacher_map50_gate is not None:
+                            if teacher_map_baseline is None:
+                                teacher_map_baseline = teacher_map50_gate
+                                LOGGER.info(f'[GATE] Teacher mAP baseline: {teacher_map_baseline:.4f}')
+                            elif teacher_map_baseline > 0 and teacher_map50_gate < teacher_map_baseline * 0.5:
                                 LOGGER.warning(
-                                    f'[GATE] Teacher degraded! Loss {teacher_source_loss_val:.4f} > '
-                                    f'2x baseline {source_loss_baseline:.4f}. Pausing EMA for 500 steps.'
+                                    f'[GATE] Teacher degraded (mAP)! '
+                                    f'{teacher_map50_gate:.4f} < 50% baseline {teacher_map_baseline:.4f}'
                                 )
-                                teacher_ema.pause_updates(steps=500)
-                            else:
+                                gate_pause = True
+                            
+                            # ── Best teacher checkpoint ────────────────────
+                            if teacher_map50_gate > best_teacher_map50:
+                                best_teacher_map50 = teacher_map50_gate
+                                best_teacher_state = {
+                                    k: v.clone() for k, v in model_teacher.state_dict().items()
+                                }
                                 LOGGER.info(
-                                    f'[GATE] Teacher OK: loss={teacher_source_loss_val:.4f} '
-                                    f'(baseline={source_loss_baseline:.4f})'
+                                    f'[GATE] ✨ New best teacher: mAP@50={best_teacher_map50:.4f}'
                                 )
-                    
-                    # ── Pseudo-labels from teacher ──
-                    with torch.no_grad():
-                        pred_teacher = model_teacher(imgs_target_fake)
-                        
-                        # Thu thập feature của Teacher trên ảnh target-fake
-                        # (dùng cho Feature MSE Distillation: MSE(Student(src_real), Teacher(tgt_fake)))
-                        if teacher_feature_hook is not None:
-                            teacher_feat_for_mse = teacher_feature_hook.get_features()
-                        
-                        if isinstance(pred_teacher, dict):
-                            # Ưu tiên lấy 'one2many' cho Knowledge Distillation (dùng kèm NMS)
-                            # 'one2one' (end-to-end) thường rất sparse và confidence thấp do Hungarian Matching.
-                            pred_tensor = pred_teacher.get('one2many', pred_teacher.get('one2one', None))
-                            if pred_tensor is not None:
-                                pred_tensor = pred_tensor[0] if isinstance(pred_tensor, (list, tuple)) else pred_tensor
+                            
+                            # Quality gate: enable/disable distillation based on teacher quality
+                            if teacher_map50_gate >= 0.30:
+                                if not teacher_quality_ok:
+                                    LOGGER.info(f'[GATE] ✅ Teacher quality OK (mAP@50={teacher_map50_gate:.4f} >= 0.30), enabling distillation')
+                                teacher_quality_ok = True
                             else:
-                                pred_tensor = torch.zeros(1, 84, 10, device=device)
-                        elif isinstance(pred_teacher, (list, tuple)):
-                            pred_tensor = pred_teacher[0]
+                                if teacher_quality_ok:
+                                    LOGGER.warning(f'[GATE] ❌ Teacher quality insufficient (mAP@50={teacher_map50_gate:.4f} < 0.30), pausing distillation')
+                                teacher_quality_ok = False
+                        
+                        if gate_pause:
+                            # If we have a good teacher checkpoint, RESTORE it
+                            # instead of just pausing (which only delays the collapse)
+                            if best_teacher_state is not None and best_teacher_map50 > 0.1:
+                                LOGGER.warning(
+                                    f'[GATE] 🔄 Restoring best teacher '
+                                    f'(mAP@50={best_teacher_map50:.4f}) and pausing EMA for 1000 steps.'
+                                )
+                                model_teacher.load_state_dict(best_teacher_state)
+                                teacher_ema.pause_updates(steps=1000)
+                            else:
+                                LOGGER.warning('[GATE] Pausing EMA for 500 steps.')
+                                teacher_ema.pause_updates(steps=500)
+                        elif source_loss_baseline is not None:
+                            map_info = f', mAP@50={teacher_map50_gate:.4f}' if teacher_map50_gate else ''
+                            LOGGER.info(
+                                f'[GATE] Teacher OK: loss={teacher_source_loss_val:.4f} '
+                                f'(baseline={source_loss_baseline:.4f}){map_info}'
+                            )
+                    
+                    # Teacher forward for pseudo-labels
+                    # ──────────────────────────────────────────────────────
+                    # FIX (augmentation-alignment): use the SAME augmented
+                    # target_real tensor the student saw. Previously we ran
+                    # teacher on imgs_target_fake, but target_real and
+                    # target_fake pass through YOLODataset independently —
+                    # mosaic/flip/scale are sampled per dataset, so the two
+                    # tensors are NOT spatially paired at training time even
+                    # if their filenames match. That mis-aligned pseudo-
+                    # labels caused target-mAP collapse once distillation
+                    # turned on, while source-mAP stayed healthy.
+                    #
+                    # Feature KD (when --use-feature-distill is set) still
+                    # needs teacher(target_fake), so we run a SECOND forward
+                    # only in that case.
+                    # ──────────────────────────────────────────────────────
+                    with torch.no_grad():
+                        pred_teacher = model_teacher(imgs_target)
+                        _ = teacher_backbone_hook.get_features()  # drain (target_real feats)
+
+                        if getattr(opt, 'use_feature_distill', False):
+                            _ = model_teacher(imgs_target_fake)
+                            feat_teacher_tf = teacher_backbone_hook.get_features()
                         else:
-                            pred_tensor = pred_teacher
+                            feat_teacher_tf = None
+                        
+                        # ════════════════════════════════════════════════════
+                        # PSEUDO-LABEL GENERATION — Use ONE2MANY head + NMS
+                        # ════════════════════════════════════════════════════
+                        # YOLO26 E2E model has TWO detection heads:
+                        #   - one2one:  TAL topk=1, sparse, low conf → for NMS-free deploy
+                        #   - one2many: TAL topk=10, dense, high conf → for training
+                        # In eval mode, model returns (y_postprocessed, raw_preds_dict).
+                        # y_postprocessed uses one2one head → conf typically < 0.4
+                        # We MUST use one2many head for pseudo-label generation.
+                        # ════════════════════════════════════════════════════
                         
                         teacher_output_valid = True
-                        if pred_tensor is not None and isinstance(pred_tensor, torch.Tensor):
+                        pseudo_labels = None
+                        
+                        # Extract raw predictions dict
+                        if isinstance(pred_teacher, (list, tuple)) and len(pred_teacher) == 2:
+                            raw_preds = pred_teacher[1]  # raw dict: {"one2many": {...}, "one2one": {...}}
+                        elif isinstance(pred_teacher, dict):
+                            raw_preds = pred_teacher
+                        else:
+                            raw_preds = None
+                            teacher_output_valid = False
+                        
+                        if teacher_output_valid and isinstance(raw_preds, dict) and 'one2many' in raw_preds:
+                            # ── Use one2many head: decode boxes + sigmoid + NMS ──
+                            o2m_preds = raw_preds['one2many']
+                            
+                            # Access Detect head for box decoding (anchors/strides)
+                            detect_head = model_teacher.model[-1]
+                            
+                            # Decode boxes: raw DFL distribution → xyxy coordinates
+                            dbox = detect_head._get_decode_boxes(o2m_preds)
+                            
+                            # CRITICAL: _get_decode_boxes returns xyxy format (E2E models use xywh=False),
+                            # but non_max_suppression expects xywh and calls xywh2xyxy internally.
+                            # Without this conversion, NMS double-converts → garbage boxes.
+                            x1, y1, x2, y2 = dbox.chunk(4, dim=1)
+                            dbox = torch.cat([
+                                (x1 + x2) / 2,  # cx
+                                (y1 + y2) / 2,  # cy
+                                x2 - x1,         # w
+                                y2 - y1,         # h
+                            ], dim=1)
+                            
+                            # Apply sigmoid to raw class logits
+                            cls_sigmoid = o2m_preds['scores'].sigmoid()
+                            # Combine: [B, 4+nc, N]
+                            pred_tensor = torch.cat([dbox, cls_sigmoid], dim=1)
+                            
+                            # NaN/Inf check
                             if torch.isnan(pred_tensor).any() or torch.isinf(pred_tensor).any():
                                 teacher_output_valid = False
-                                pred_tensor = torch.zeros_like(pred_tensor)
+                                LOGGER.warning(f'[TEACHER] NaN/Inf in one2many output at epoch {epoch}, iter {i}')
+                            
+                            if teacher_output_valid:
+                                pseudo_labels = non_max_suppression(
+                                    pred_tensor,
+                                    conf_thres=TEACHER_CONF_THRES,
+                                    iou_thres=opt.iou_thres,
+                                    max_det=30,
+                                    classes=list(class_mapping.keys()),  # Only keep relevant COCO classes
+                                    agnostic=True,  # CRITICAL: class-agnostic NMS prevents
+                                    # same object being detected as both COCO class 1 AND class 2,
+                                    # which after class_mapping creates DUPLICATE pseudo-labels
+                                )
+                            
+                            # Diagnostic: log one2one vs one2many at first distillation iter
+                            if epoch == burn_in_epochs and i == 0:
+                                o2o_postproc = pred_teacher[0]  # one2one postprocessed [B, 300, 6]
+                                o2o_max = o2o_postproc[:, :, 4].max().item()
+                                o2o_above = int((o2o_postproc[:, :, 4] > TEACHER_CONF_THRES).sum())
+                                o2m_max = cls_sigmoid.max().item()
+                                o2m_above = int((cls_sigmoid.max(dim=1).values > TEACHER_CONF_THRES).sum())
+                                LOGGER.info(
+                                    f'[DIAG] one2one: max_conf={o2o_max:.4f}, above_{TEACHER_CONF_THRES}={o2o_above} | '
+                                    f'one2many: max_conf={o2m_max:.4f}, above_{TEACHER_CONF_THRES}={o2m_above}'
+                                )
                         else:
-                            teacher_output_valid = False
-                            # Fallback tensor small length (10) since 8400 is no longer valid for P2
-                            pred_tensor = torch.zeros(1, 6, 10, device=device)
+                            # Fallback: non-E2E model (e.g. YOLOv8)
+                            if isinstance(pred_teacher, (list, tuple)):
+                                pred_tensor = pred_teacher[0]
+                            elif isinstance(pred_teacher, dict):
+                                pred_tensor = pred_teacher.get('one2many', pred_teacher.get('one2one', None))
+                                if pred_tensor is not None:
+                                    pred_tensor = pred_tensor[0] if isinstance(pred_tensor, (list, tuple)) else pred_tensor
+                                else:
+                                    pred_tensor = torch.zeros(1, 84, 10, device=device)
+                                    teacher_output_valid = False
+                            else:
+                                pred_tensor = pred_teacher
+                            
+                            if teacher_output_valid and isinstance(pred_tensor, torch.Tensor):
+                                if torch.isnan(pred_tensor).any() or torch.isinf(pred_tensor).any():
+                                    teacher_output_valid = False
+                            
+                            if teacher_output_valid and pseudo_labels is None:
+                                # Handle E2E format [B, 300, 6] or raw [B, 4+nc, N]
+                                if len(pred_tensor.shape) == 3 and pred_tensor.shape[-1] == 6:
+                                    pseudo_labels = []
+                                    for bi in range(pred_tensor.shape[0]):
+                                        mask = pred_tensor[bi, :, 4] > TEACHER_CONF_THRES
+                                        valid_boxes = pred_tensor[bi, mask]
+                                        if len(valid_boxes) > 30:
+                                            _, sorted_idx = torch.sort(valid_boxes[:, 4], descending=True)
+                                            valid_boxes = valid_boxes[sorted_idx[:30]]
+                                        pseudo_labels.append(valid_boxes)
+                                else:
+                                    if len(pred_tensor.shape) == 3 and pred_tensor.shape[1] > pred_tensor.shape[-1]:
+                                        pred_tensor = pred_tensor.permute(0, 2, 1)
+                                    cls_scores = pred_tensor[:, 4:, :]
+                                    if cls_scores.max() > 1.0 or cls_scores.min() < 0.0:
+                                        pred_tensor = torch.cat([
+                                            pred_tensor[:, :4, :],
+                                            torch.sigmoid(cls_scores)
+                                        ], dim=1)
+                                    pseudo_labels = non_max_suppression(
+                                        pred_tensor,
+                                        conf_thres=TEACHER_CONF_THRES,
+                                        iou_thres=opt.iou_thres,
+                                        max_det=30,
+                                        classes=list(class_mapping.keys()),
+                                        agnostic=True,
+                                    )
                         
-                        # Tensor trước khi vào NMS phải ở chuẩn Ultralytics: [B, 4+nc, N]
-                        # Nếu đang ở dạng [B, N, 4+nc] (ví dụ: [1, 8400, 84]), ta cần permute lại
-                        if teacher_output_valid and len(pred_tensor.shape) == 3:
-                            if pred_tensor.shape[-1] != 6:  # Bỏ qua nếu đã là End-to-End inference format [B, 300, 6]
-                                # N > 4+nc => shape[1] > shape[-1]
-                                if pred_tensor.shape[1] > pred_tensor.shape[-1]:
-                                    pred_tensor = pred_tensor.permute(0, 2, 1)
-                                
-                                # Apply sigmoid nếu cần
-                                cls_scores = pred_tensor[:, 4:, :]
-                                if cls_scores.max() > 1.0 or cls_scores.min() < 0.0:
-                                    pred_tensor = torch.cat([
-                                        pred_tensor[:, :4, :],
-                                        torch.sigmoid(cls_scores)
-                                    ], dim=1)
+                        # Fallback: empty pseudo-labels if generation failed
+                        if pseudo_labels is None:
+                            pseudo_labels = [torch.zeros(0, 6, device=device)
+                                             for _ in range(imgs_target.shape[0])]
                         
-                        # Adaptive confidence threshold (curriculum learning)
-                        # After burn-in: start strict (max_conf) and relax over time
-                        adaptive_conf = get_adaptive_conf_thres(
-                            epoch, opt.epochs, opt.conf_thres,
-                            max_conf=getattr(opt, 'conf_thres_max', 0.7),
-                            burn_in_epochs=burn_in_epochs,
-                        )
-                        
-                        # NMS with reduced max_det to prevent box explosion
-                        pseudo_labels = non_max_suppression(
-                            pred_tensor,
-                            conf_thres=adaptive_conf,
-                            iou_thres=opt.iou_thres,
-                            max_det=20,
-                        )
-                        
+                        # Filter pseudo-labels (box validity + class filter)
                         valid_coco_classes = set(class_mapping.keys())
                         
                         for idx, preds in enumerate(pseudo_labels):
@@ -577,12 +938,10 @@ def train(opt):
                                 box_area = box_w * box_h
                                 img_area = img_w * img_h
                                 
-                                # Track exploded boxes for logging
                                 large_boxes = (box_area >= 0.8 * img_area).sum().item()
                                 if large_boxes > 0 and i == 0:
-                                    LOGGER.warning(f"[WARNING] Epoch {epoch}: Discarded {large_boxes} exploded pseudo-labels (>80% image area). Teacher diverging!")
+                                    LOGGER.warning(f"[WARNING] Epoch {epoch}: Discarded {large_boxes} exploded pseudo-labels (>80% image area)")
                                 
-                                # Enforce min dimensions (5x5) and max area (80% of image)
                                 valid_box = (box_w > 5) & (box_h > 5) & (box_area < 0.8 * img_area)
                                 
                                 cls_ids = preds[:, 5].long()
@@ -591,55 +950,37 @@ def train(opt):
                                     valid_cls |= (cls_ids == coco_cls)
                                 
                                 valid = valid_box & valid_cls
-                                filtered_preds = preds[valid]
-                                
-                                if len(filtered_preds) > 0:
-                                    for coco_cls, dataset_cls in class_mapping.items():
-                                        mask = (filtered_preds[:, 5].long() == coco_cls)
-                                        filtered_preds[mask, 5] = dataset_cls
-                                
-                                pseudo_labels[idx] = filtered_preds
+                                pseudo_labels[idx] = preds[valid]
                         
                         n_pseudo = sum(len(p) if p is not None else 0 for p in pseudo_labels)
                         
-                        # Debug images (skip in tuning mode to save disk)
-                        tuning_mode = getattr(opt, 'tuning_mode', False)
+                        # Debug images (BEFORE quality gate so we see actual teacher detections)
                         if not tuning_mode and i % 100 == 0:
                             debug_dir = save_dir / 'debug_images'
                             debug_dir.mkdir(exist_ok=True)
+                            # Draw pseudo-labels on target_real (matches the
+                            # tensor teacher was run on, so boxes align).
                             n_boxes = save_debug_image(
-                                imgs_target_fake[0],
+                                imgs_target[0],
                                 [pseudo_labels[0]] if pseudo_labels else None,
                                 debug_dir / f'epoch{epoch:03d}_iter{epoch * nb + i:06d}_teacher.jpg',
                                 names,
-                                conf_thres=adaptive_conf
+                                conf_thres=TEACHER_CONF_THRES
                             )
-                            LOGGER.info(f'[DEBUG] Epoch {epoch}: Teacher detections={n_boxes}, conf={adaptive_conf:.3f}')
+                            LOGGER.info(f'[DEBUG] Epoch {epoch}: Teacher detections={n_boxes}, conf={TEACHER_CONF_THRES:.3f}')
+                        
+                        # Quality gate: zero out pseudo-labels if teacher hasn't passed quality check
+                        if not teacher_quality_ok:
+                            pseudo_labels = [torch.zeros(0, 6, device=device)
+                                             for _ in range(imgs_target.shape[0])]
+                            n_pseudo = 0
+                            if i == 0:
+                                LOGGER.info(f'[QUALITY-GATE] Distillation paused: waiting for teacher mAP@50 >= 0.30')
+
+                # ══════════════════════════════════════════════════════════
+                # LOSS COMPUTATION — Clean, no gradient overlap
+                # ══════════════════════════════════════════════════════════
                 
-                # Distillation loss (pseudo-box labels)
-                loss_distillation = compute_loss.compute_distillation_loss(
-                    pred_target, pseudo_labels, (img_h, img_w)
-                )
-                
-                # ── Feature MSE Distillation ──────────────────────────────
-                # Ép Student(source-real features) gần với Teacher(target-fake features)
-                # Gradient chỉ chảy vào Student; teacher_feat được detach.
-                loss_feature_mse = torch.tensor(0.0, device=device, requires_grad=False)
-                if (getattr(opt, 'use_feature_distill', False)
-                        and teacher_feat_for_mse is not None
-                        and source_features is not None
-                        and epoch >= burn_in_epochs):
-                    tf = teacher_feat_for_mse.detach()  # không cập nhật Teacher
-                    sf = source_features
-                    # Align spatial size nếu 2 feature map khác nhau (hiếm, nhưng an toàn)
-                    if sf.shape != tf.shape:
-                        tf = torch.nn.functional.interpolate(
-                            tf, size=sf.shape[2:], mode='bilinear', align_corners=False
-                        )
-                    loss_feature_mse = torch.nn.functional.mse_loss(sf, tf)
-                
-                # Total loss
-                # L = Ldet(src) + Ldet(src_fake) + λ_box·Ldistill + λ_feat·Lfeat_mse + β·Lcons + Ldomain
                 def ensure_scalar(x):
                     if isinstance(x, torch.Tensor) and x.numel() > 1:
                         return x.sum()
@@ -647,19 +988,126 @@ def train(opt):
                 
                 loss_source       = ensure_scalar(loss_source)
                 loss_source_fake  = ensure_scalar(loss_source_fake)
-                loss_distillation = ensure_scalar(loss_distillation)
-                loss_feature_mse  = ensure_scalar(loss_feature_mse)
-                loss_domain       = ensure_scalar(loss_domain)
                 
-                # Consistency loss: L2(Ldet(source) - Ldet(source_fake))
-                loss_diff = torch.clamp(loss_source.detach() - loss_source_fake, -10, 10)
-                loss_consistency = loss_diff ** 2
-                consistency_weight = 1.0
+                # ── Loss 1: Pseudo-label distillation ─────────────────────
+                # Student(target_real) learns from teacher's pseudo-labels
+                if pred_target is not None:
+                    loss_distillation = compute_loss.compute_distillation_loss(
+                        pred_target, pseudo_labels, (img_h, img_w)
+                    )
+                    loss_distillation = ensure_scalar(loss_distillation)
+                    
+                    # Cap distillation loss to prevent it from overwhelming source GT loss
+                    if loss_distillation.requires_grad and loss_distillation.item() > 0 and loss_source.item() > 0:
+                        max_distill = loss_source.item() * 1.5
+                        if loss_distillation.item() > max_distill:
+                            scale = max_distill / loss_distillation.item()
+                            loss_distillation = loss_distillation * scale
+                else:
+                    loss_distillation = torch.tensor(0.0, device=device, requires_grad=False)
                 
+                # ── Loss 2: Feature KD ────────────────────────────────────
+                # Student(target_real) features ↔ Teacher(target_fake) features
+                # Teacher side detached — gradient only flows to student
+                loss_feature_kd = torch.tensor(0.0, device=device, requires_grad=False)
                 lambda_feature = getattr(opt, 'lambda_feature', 0.05)
-                loss = (loss_source + loss_source_fake
+                
+                if (getattr(opt, 'use_feature_distill', False)
+                        and feat_teacher_tf is not None
+                        and feat_tr is not None
+                        and epoch >= burn_in_epochs):
+                    tf = feat_teacher_tf.detach()  # Teacher features — NO gradient
+                    sf = feat_tr                    # Student features — gradient flows here
+                    
+                    if sf.shape != tf.shape:
+                        tf = torch.nn.functional.interpolate(
+                            tf, size=sf.shape[2:], mode='bilinear', align_corners=False
+                        )
+                    # Cosine loss: scale-invariant, values in [0, 2]
+                    cos_sim = torch.nn.functional.cosine_similarity(sf, tf, dim=1)
+                    loss_feature_kd = 1.0 - cos_sim.mean()
+                
+                # ── Loss 3: Consistency ───────────────────────────────────
+                # student(source_real) features ↔ student(source_fake) features
+                # Source_real is anchor (detached) — gradient only to source_fake path
+                loss_consistency = torch.tensor(0.0, device=device, requires_grad=False)
+                consistency_weight = getattr(opt, 'consistency_weight', 0.5)
+                
+                if not getattr(opt, 'no_consistency', False):
+                    if feat_sr is not None and feat_sf is not None:
+                        sr_anchor = feat_sr.detach()  # Anchor: GT-supervised, detached
+                        sf_learn = feat_sf            # Learner: gradient flows here
+                        
+                        if sf_learn.shape != sr_anchor.shape:
+                            sr_anchor = torch.nn.functional.interpolate(
+                                sr_anchor, size=sf_learn.shape[2:], mode='bilinear', align_corners=False
+                            )
+                        cos_sim = torch.nn.functional.cosine_similarity(sf_learn, sr_anchor, dim=1)
+                        loss_consistency = 1.0 - cos_sim.mean()
+                
+                # ── Loss 4: Domain adversarial (GRL) ──────────────────────
+                # Features: source_real vs target_real → discriminator
+                # GRL reverses gradient → backbone learns domain-invariant features
+                loss_domain = torch.tensor(0.0, device=device, requires_grad=False)
+                domain_acc  = 0.0
+
+                if opt.use_grl and epoch >= opt.grl_warmup:
+                    effective_grl_weight = opt.grl_weight
+                    if prev_domain_acc > 0.75:
+                        boost = 1.0 + 2.0 * (prev_domain_acc - 0.75) / 0.25
+                        effective_grl_weight = min(opt.grl_weight * boost, opt.grl_weight * 3.0)
+
+                    if use_multiscale_grl and ms_discriminator is not None:
+                        if ms_feature_hook.all_available(ms_src_feats) and \
+                           ms_feature_hook.all_available(ms_tgt_feats):
+                            ms_discriminator.set_alpha(current_grl_alpha)
+                            fused_src_logit = ms_discriminator(ms_src_feats, current_grl_alpha)
+                            fused_tgt_logit = ms_discriminator(ms_tgt_feats, current_grl_alpha)
+                            loss_domain = compute_domain_loss(
+                                fused_src_logit, fused_tgt_logit
+                            ) * effective_grl_weight
+                            domain_acc = get_domain_accuracy(fused_src_logit, fused_tgt_logit)
+                            if domain_monitor:
+                                domain_monitor.update_domain_accuracy(
+                                    fused_src_logit, fused_tgt_logit, epoch, i
+                                )
+                    else:
+                        # Single-scale: source_real vs target_real features
+                        if feat_sr is not None and feat_tr is not None:
+                            domain_pred_source = domain_discriminator(feat_sr, current_grl_alpha)
+                            domain_pred_target = domain_discriminator(feat_tr, current_grl_alpha)
+                            loss_domain = compute_domain_loss(
+                                domain_pred_source, domain_pred_target
+                            ) * effective_grl_weight
+                            domain_acc = get_domain_accuracy(domain_pred_source, domain_pred_target)
+                            if domain_monitor:
+                                domain_monitor.update_domain_accuracy(
+                                    domain_pred_source, domain_pred_target, epoch, i
+                                )
+                
+                loss_domain = ensure_scalar(loss_domain)
+                
+                # ── Total Loss ────────────────────────────────────────────
+                # Each loss component has clean, non-overlapping gradient paths:
+                #   loss_source:      ∂/∂θ via forward #1 (normal)
+                #   loss_source_fake: ∂/∂θ via forward #2 (normal)
+                #   loss_distillation:∂/∂θ via forward #3 (normal, pseudo-labels are fixed targets)
+                #   loss_feature_kd:  ∂/∂θ via feat_tr from forward #3 (teacher side detached)
+                #   loss_consistency: ∂/∂θ via feat_sf from forward #2 (source_real side detached)
+                #   loss_domain:      ∂/∂θ via feat_sr, feat_tr through GRL (reversed)
+                # source_fake uses CycleGAN images with GT labels — training at full
+                # weight causes overfitting to style-transfer artifacts, degrading
+                # performance on real target domain.
+                # Progressive decay: start at configured weight → reduce to 20% by end.
+                # This gives CycleGAN diversity early (helpful) while reducing noise later.
+                sf_base_weight = getattr(opt, 'source_fake_weight', 0.1)
+                progress = epoch / max(opt.epochs - 1, 1)
+                sf_weight = sf_base_weight * max(0.2, 1.0 - progress * 0.8)
+                
+                loss = (loss_source
+                        + loss_source_fake * sf_weight
                         + loss_distillation * current_lambda
-                        + loss_feature_mse  * lambda_feature
+                        + loss_feature_kd   * lambda_feature
                         + loss_consistency  * consistency_weight
                         + loss_domain)
                 loss = torch.clamp(loss, 0, 500)
@@ -704,10 +1152,15 @@ def train(opt):
                 continue
 
             scaler.step(optimizer)
-            # Always update discriminator — stopping it when it's winning is backwards
-            # (the GRL still pushes the backbone but discriminator can't adapt → stays dominant)
+            
+            # Discriminator Throttling
             if grl_optimizer_active:
-                scaler.step(grl_optimizer)
+                if domain_acc > 0.85:
+                    if i % 100 == 0:
+                        LOGGER.info(f'[Throttling] Discriminator acc {domain_acc:.3f} > 0.85. Pausing D update.')
+                else:
+                    scaler.step(grl_optimizer)
+                    
             scaler.update()
 
             optimizer.zero_grad()
@@ -716,12 +1169,12 @@ def train(opt):
             
             # EMA update (AFTER optimizer.step!)
             teacher_ema.update(model_student)
-            prev_domain_acc = domain_acc  # carry forward for next iteration's GRL weight boost
+            prev_domain_acc = domain_acc
             
             if i % 100 == 0:
                 torch.cuda.empty_cache()
             
-            # Logging
+            # ── Logging ───────────────────────────────────────────────────
             loss_items = torch.tensor([
                 loss_items_source[0].item() if isinstance(loss_items_source, (list, tuple)) else loss_source.item(),
                 loss_items_source[1].item() if isinstance(loss_items_source, (list, tuple)) and len(loss_items_source) > 1 else 0,
@@ -733,39 +1186,55 @@ def train(opt):
             mloss = (mloss * i + loss_items) / (i + 1)
             
             log_dict = {
-                'loss_sr':           loss_source.item(),
-                'loss_sf':           loss_source_fake.item(),
+                'loss_source':       loss_source.item(),
+                'loss_source_fake':  loss_source_fake.item(),
                 'loss_distill':      loss_distillation.item(),
+                'loss_feature_kd':   loss_feature_kd.item(),
                 'loss_consistency':  loss_consistency.item(),
                 'loss_domain':       loss_domain.item(),
                 'loss_total':        loss.item(),
             }
-            if getattr(opt, 'use_feature_distill', False):
-                log_dict['loss_feat_mse'] = loss_feature_mse.item()
+
+            # Warn if source_fake loss is disproportionately large — its gradient
+            # (even scaled by sf_weight) can drag the student toward CycleGAN
+            # artefacts, which is a documented cause of target-mAP collapse.
+            if i == 0 and sf_base_weight > 0 and loss_source.item() > 0:
+                ratio = loss_source_fake.item() / max(loss_source.item(), 1e-6)
+                if ratio > 3.0:
+                    LOGGER.warning(
+                        f'[DIAG] loss_source_fake={loss_source_fake.item():.2f} is '
+                        f'{ratio:.1f}× loss_source={loss_source.item():.2f}. '
+                        f'Contributing {loss_source_fake.item() * sf_weight:.2f} to total '
+                        f'(sf_weight={sf_weight:.3f}). Consider --source-fake-weight 0 '
+                        f'if student target mAP is stuck.'
+                    )
             
             logger.log_iteration(epoch, i, log_dict, extra={
                 'lr':         optimizer.param_groups[0]['lr'],
                 'grl_alpha':  current_grl_alpha if opt.use_grl else 0,
-                'conf_thres': adaptive_conf,
+                'conf_thres': TEACHER_CONF_THRES,
                 'lambda':     current_lambda,
+                'n_pseudo':   n_pseudo,
+                'domain_acc': domain_acc,
             }, global_step=global_step)
             global_step += 1
             
             if domain_monitor and i % 50 == 0 and i < 500:
+                # Use detached copies for monitoring to avoid any gradient interference
                 domain_monitor.collect_features(
-                    features_sr=source_features,
-                    features_sf=source_fake_features,
-                    features_tr=target_features,
-                    max_batches=50,  # More samples for meaningful UMAP
+                    features_sr=feat_sr.detach() if feat_sr is not None else None,
+                    features_sf=feat_sf.detach() if feat_sf is not None else None,
+                    features_tr=feat_tr.detach() if feat_tr is not None else None,
+                    max_batches=50,
                 )
             
             mem = f'{torch.cuda.memory_reserved() / 1e9:.1f}G' if torch.cuda.is_available() else 'CPU'
-            feat_mse_str = f'{loss_feature_mse.item():.4f}' if getattr(opt, 'use_feature_distill', False) else '-'
             pbar.set_postfix({
                 'mem':     mem,
                 'box':     f'{mloss[0]:.4f}',
                 'distill': f'{mloss[3]:.4f}',
-                'feat':    feat_mse_str,
+                'feat_kd': f'{loss_feature_kd.item():.4f}',
+                'cons':    f'{loss_consistency.item():.4f}',
                 'domain':  f'{mloss[4]:.4f}',
             })
         
@@ -783,29 +1252,89 @@ def train(opt):
         gc.collect()
         torch.cuda.empty_cache()
         
-        # Validation
-        if (epoch + 1) % 10 == 0 or epoch == opt.epochs - 1:
-            orig_model = yolo_student.model
+        # Validation (Student + Teacher side-by-side)
+        if (epoch + 1) % 5 == 0 or epoch == opt.epochs - 1:
             try:
-                val_yolo = YOLO(opt.weights)
-                val_model = val_yolo.model.to(device)
-                val_model.load_state_dict(model_student.state_dict())
-                val_model.eval()
-                yolo_student.model = val_model
-                
-                metrics = yolo_student.val(data=opt.data, split='test', verbose=False)
+                LOGGER.info(f'\n===== VALIDATION @ epoch {epoch} =====')
+                # ── Student mAP on TARGET (data.yaml → test = target_real) ──
+                metrics = validate_model(
+                    tag='STUDENT', state_dict=model_student.state_dict(),
+                    weights_path=opt.weights, data_yaml=opt.data, split='test',
+                    device=device, dataset_label='target_real (test split)',
+                )
                 current_map50 = metrics.box.map50
-                current_map = metrics.box.map
-                
-                LOGGER.info(f'Epoch {epoch}: mAP@50={current_map50:.4f}, mAP@50-95={current_map:.4f}')
+                current_map   = metrics.box.map
+
+                # ── Student mAP on SOURCE (dual validation) ──────────
+                source_map50 = 0.0
+                if getattr(opt, 'eval_source', False) or baseline_mode:
+                    try:
+                        metrics_src = validate_model(
+                            tag='STUDENT', state_dict=model_student.state_dict(),
+                            weights_path=opt.weights, data_yaml='data_clear.yaml', split='test',
+                            device=device, dataset_label='source_real (data_clear.yaml)',
+                        )
+                        source_map50 = metrics_src.box.map50
+                    except Exception as e:
+                        LOGGER.warning(f'Source validation failed: {e}')
+
+                # ── Teacher mAP on TARGET ────────────────────────────
+                teacher_map50_val = 0.0
+                teacher_map_val = 0.0
+                if not baseline_mode:
+                    try:
+                        metrics_t = validate_model(
+                            tag='TEACHER', state_dict=model_teacher.state_dict(),
+                            weights_path=opt.weights, data_yaml=opt.data, split='test',
+                            device=device, dataset_label='target_real (test split)',
+                        )
+                        teacher_map50_val = metrics_t.box.map50
+                        teacher_map_val = metrics_t.box.map
+                    except Exception as e:
+                        LOGGER.warning(f'Teacher validation failed: {e}')
+
+                if baseline_mode:
+                    LOGGER.info(
+                        f'Epoch {epoch}: '
+                        f'Source mAP@50={source_map50:.4f}  |  '
+                        f'Target mAP@50={current_map50:.4f} mAP={current_map:.4f}'
+                    )
+                else:
+                    src_info = f'  |  Source mAP@50={source_map50:.4f}' if source_map50 > 0 else ''
+                    LOGGER.info(
+                        f'Epoch {epoch}: '
+                        f'Student mAP@50={current_map50:.4f} mAP={current_map:.4f}  |  '
+                        f'Teacher mAP@50={teacher_map50_val:.4f} mAP={teacher_map_val:.4f}'
+                        f'{src_info}'
+                    )
                 
                 logger.log_epoch(epoch, {
                     'mAP50': current_map50,
                     'mAP50-95': current_map,
                     'precision': metrics.box.mp,
                     'recall': metrics.box.mr,
+                    'source_mAP50': source_map50,
+                    'teacher_mAP50': teacher_map50_val,
+                    'teacher_mAP50-95': teacher_map_val,
+                    'student_target_minus_source': current_map50 - source_map50 if source_map50 > 0 else 0.0,
                 })
-                
+
+                # Diagnostic: student source high but target low → DA gap (expected)
+                # Both source and target low → training is broken (model/loss issue)
+                if source_map50 > 0:
+                    if source_map50 < 0.1 and current_map50 < 0.1:
+                        LOGGER.warning(
+                            f'[DIAG] Student collapsed on BOTH domains '
+                            f'(src={source_map50:.3f}, tgt={current_map50:.3f}) — '
+                            f'likely training instability, not a DA failure. '
+                            f'Check loss_source_fake magnitude and BN stats.'
+                        )
+                    elif current_map50 < source_map50 * 0.3:
+                        LOGGER.info(
+                            f'[DIAG] Large domain gap: student source={source_map50:.3f} '
+                            f'vs target={current_map50:.3f}'
+                        )
+
                 if current_map50 > best_fitness:
                     best_fitness = current_map50
                     torch.save({
@@ -814,11 +1343,31 @@ def train(opt):
                         'optimizer': optimizer.state_dict(),
                         'best_fitness': best_fitness,
                     }, save_dir / 'weights' / 'best.pt')
+
+                # Best student state restore — mirror of the teacher safeguard.
+                # If the student collapses > 50% below its best target mAP, revert
+                # to the best weights (and reset optimizer momentum) so we don't
+                # keep feeding bad pseudo-labels back through the EMA.
+                if current_map50 > best_student_map50:
+                    best_student_map50 = current_map50
+                    best_student_state = {k: v.clone() for k, v in model_student.state_dict().items()}
+                    LOGGER.info(f'[STUDENT-GATE] ✨ New best student: mAP@50={best_student_map50:.4f}')
+                elif (best_student_map50 > 0.1
+                      and current_map50 < best_student_map50 * 0.5
+                      and best_student_state is not None):
+                    LOGGER.warning(
+                        f'[STUDENT-GATE] 🔄 Student collapsed '
+                        f'(current={current_map50:.4f} < 50% of best={best_student_map50:.4f}). '
+                        f'Restoring best student weights.'
+                    )
+                    model_student.load_state_dict(best_student_state)
+                    # Clear optimizer momentum to avoid immediately re-entering the bad region.
+                    # Must rebuild as defaultdict(dict) — plain defaultdict() has no factory
+                    # and raises KeyError inside Adam._init_group on the next step.
+                    optimizer.state = defaultdict(dict)
             except Exception as e:
                 LOGGER.warning(f'Validation failed: {e}')
             finally:
-                yolo_student.model = orig_model
-                del val_model, val_yolo
                 gc.collect()
                 torch.cuda.empty_cache()
         
@@ -842,15 +1391,14 @@ def train(opt):
             torch.save(ckpt_data, save_dir / 'weights' / f'checkpoint_ep{epoch:03d}.pt')
             LOGGER.info(f'💾 Saved checkpoint: checkpoint_ep{epoch:03d}.pt (student + teacher)')
     
-    # Cleanup
+    # ══════════════════════════════════════════════════════════════════════
+    # CLEANUP & CHARTS
+    # ══════════════════════════════════════════════════════════════════════
+    student_backbone_hook.remove()
+    teacher_backbone_hook.remove()
     if ms_feature_hook:
         ms_feature_hook.remove()
-    if feature_hook and feature_hook is not monitor_hook:
-        feature_hook.remove()
-    if monitor_hook:
-        monitor_hook.remove()
-    if teacher_feature_hook:
-        teacher_feature_hook.remove()
+    
     logger.finalize()
     if domain_monitor:
         domain_monitor.finalize()
@@ -872,10 +1420,10 @@ def parse_args():
     parser.add_argument('--cfg', type=str, default=None, help='custom model.yaml file (e.g. yolov8-p2.yaml)')
     parser.add_argument('--weights', type=str, default='yolo26s.pt')
     parser.add_argument('--data', type=str, default='data_v8.yaml')
-    parser.add_argument('--imgsz', type=int, default=640)
+    parser.add_argument('--imgsz', type=int, default=1024)
     
     # Training
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch', type=int, default=16)
     parser.add_argument('--device', type=str, default='0')
     parser.add_argument('--workers', type=int, default=8)
@@ -884,24 +1432,25 @@ def parse_args():
     
     # Teacher-Student
     parser.add_argument('--teacher-alpha', type=float, default=0.9999)
-    parser.add_argument('--conf-thres', type=float, default=0.1)
+    parser.add_argument('--conf-thres', type=float, default=0.4)
     parser.add_argument('--conf-thres-max', type=float, default=0.7)
     parser.add_argument('--iou-thres', type=float, default=0.45)
-    parser.add_argument('--lambda-weight', type=float, default=0.1)
+    parser.add_argument('--lambda-weight', type=float, default=0.2)
     parser.add_argument('--freeze-teacher', action='store_true', default=None)
     
     # Progressive
     parser.add_argument('--use-progressive-lambda', action='store_true')
     parser.add_argument('--warmup-epochs', type=int, default=10)
-    parser.add_argument('--burn-in-epochs', type=int, default=50)
+    parser.add_argument('--burn-in-epochs', type=int, default=5)
     
     # GRL
     parser.add_argument('--use-grl', action='store_true')
     parser.add_argument('--use-multiscale-grl', action='store_true',
                         help='Use multi-scale domain discriminator (P3+P4+P5). '
                              'More SOTA but ~15%% more compute. Requires --use-grl.')
-    parser.add_argument('--grl-warmup', type=int, default=20,
-                        help='Epochs before GRL activates (increased from 10 for stability)')
+    parser.add_argument('--grl-warmup', type=int, default=5,
+                        help='Epochs before GRL + consistency activate. '
+                             'Also controls consistency start epoch when --use-grl is set.')
     parser.add_argument('--grl-max-alpha', type=float, default=1.0)
     parser.add_argument('--grl-weight', type=float, default=0.05,
                         help='GRL loss weight (increased to 0.05 to match detection loss)')
@@ -919,17 +1468,37 @@ def parse_args():
     # Misc
     parser.add_argument('--enable-monitoring', action='store_true')
     parser.add_argument('--amp', action='store_true')
+    parser.add_argument('--baseline', action='store_true',
+                        help='Pure YOLO detection: only source_real + GT labels, no DA/teacher/GRL. '
+                             'Validates on both source and target to verify detection loss.')
+    parser.add_argument('--eval-source', action='store_true',
+                        help='Also evaluate on source_real val split (dual-domain mAP)')
     
-    # ── Feature MSE Distillation ─────────────────────────────────────────
+    # ── Feature KD (Knowledge Distillation) ──────────────────────────────
     parser.add_argument(
         '--use-feature-distill', action='store_true',
-        help='Bật Feature MSE Distillation: ép Student(source-real) features '
-             'gần với Teacher(target-fake) features ở layer cuối backbone.'
+        help='Enable Feature KD: student(target_real) features ↔ teacher(target_fake) features'
     )
     parser.add_argument(
         '--lambda-feature', type=float, default=0.05,
-        help='Hệ số nhân cho Feature MSE Loss (default 0.05). '
-             'Chỉ có tác dụng khi --use-feature-distill được bật.'
+        help='Weight for Feature KD loss (default 0.05).'
+    )
+
+    # ── Consistency ──────────────────────────────────────────────────────
+    parser.add_argument(
+        '--consistency-weight', type=float, default=0.5,
+        help='Weight for feature consistency loss (source_real ↔ source_fake).'
+    )
+    parser.add_argument(
+        '--no-consistency', action='store_true',
+        help='Disable feature consistency loss (source_real ↔ source_fake).'
+    )
+
+    # ── Source-fake weight ────────────────────────────────────────────────
+    parser.add_argument(
+        '--source-fake-weight', type=float, default=0.1,
+        help='Weight for source_fake detection loss. Reduced from 1.0 to prevent '
+             'overfitting to CycleGAN artifacts. Set to 0 to disable source_fake training.'
     )
 
     # ── Small-object loss improvements ──────────────────────────────────
@@ -954,6 +1523,21 @@ def parse_args():
         help='Classification loss weight (default 0.5)'
     )
 
+    # ── Small-object Copy-Paste augmentation ─────────────────────────────
+    parser.add_argument(
+        '--use-copy-paste-small', action='store_true',
+        help='Enable Cityscapes-aware small object copy-paste augmentation '
+             'for source_real and source_fake images.'
+    )
+    parser.add_argument(
+        '--copy-paste-max-copies', type=int, default=3,
+        help='Max number of copies per small object (default 3)'
+    )
+    parser.add_argument(
+        '--copy-paste-small-thr', type=float, default=32.0,
+        help='Max side length (pixels) to consider object small (default 32)'
+    )
+
     return parser.parse_args()
 
 
@@ -967,19 +1551,27 @@ if __name__ == '__main__':
         args = config_to_namespace(config)
     
     print("=" * 70)
-    print("FDA: Semi-Supervised Domain Adaptive Training")
+    if getattr(args, 'baseline', False):
+        print("🔬 BASELINE: Pure YOLO Detection (No DA)")
+    else:
+        print("FDA: Semi-Supervised Domain Adaptive Training")
     print("=" * 70)
     print(f"Model:   {args.weights}")
     print(f"Data:    {args.data}")
     print(f"Epochs:  {args.epochs}")
     print(f"Batch:   {args.batch}")
     print(f"Device:  cuda:{args.device}")
-    grl_mode = 'Disabled'
-    if args.use_grl:
-        grl_mode = 'Multi-Scale (P3+P4+P5)' if getattr(args, 'use_multiscale_grl', False) else 'Single-Scale'
-    print(f"GRL:     {grl_mode}")
-    freeze_teacher = getattr(args, 'freeze_teacher', False)
-    print(f"Teacher: {'FROZEN' if freeze_teacher else 'EMA'}")
+    if not getattr(args, 'baseline', False):
+        grl_mode = 'Disabled'
+        if args.use_grl:
+            grl_mode = 'Multi-Scale (P3+P4+P5)' if getattr(args, 'use_multiscale_grl', False) else 'Single-Scale'
+        print(f"GRL:     {grl_mode}")
+        freeze_teacher = getattr(args, 'freeze_teacher', False)
+        print(f"Teacher: {'FROZEN' if freeze_teacher else 'EMA'}")
+        print(f"Feature KD: {'ON' if getattr(args, 'use_feature_distill', False) else 'OFF'}")
+    else:
+        print("Mode:    Source-only detection (no teacher, GRL, consistency)")
+        print("Val:     Source mAP + Target mAP (dual-domain)")
     print("=" * 70)
     
     train(args)

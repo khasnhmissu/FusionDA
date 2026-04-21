@@ -42,7 +42,20 @@ echo " STEP 1: Training 4 options"
 echo "========================================"
 
 # 1a. Full (GRL) — EMA + GRL
-echo ">>> Training: Full (GRL)"
+echo ">>> Training: Feature Distill (GRL)"
+python train.py \
+    --weights $WEIGHTS \
+    --data $DATA \
+    --epochs $EPOCHS \
+    --batch $BATCH \
+    --device $DEVICE \
+    --use-grl \
+    --use-feature-distill \
+    --enable-monitoring \
+    --project $RESULTS_DIR \
+    --name full-feature-distill
+
+echo ">>> Training: Multi-scale GRL (GRL)"
 python train.py \
     --weights $WEIGHTS \
     --data $DATA \
@@ -53,7 +66,7 @@ python train.py \
     --use-multiscale-grl \
     --enable-monitoring \
     --project $RESULTS_DIR \
-    --name full
+    --name full-multiscale-grl
 
 # 1b. NoGRL — EMA + No GRL
 # echo ">>> Training: NoGRL"
@@ -82,8 +95,9 @@ echo "========================================"
 
 python pseudo_label_quality.py --compare \
     --compare-dirs \
-        $RESULTS_DIR/full/weights \
-    --compare-names "Full (GRL)" \
+        $RESULTS_DIR/full-feature-distill/weights \
+        $RESULTS_DIR/full-multiscale-grl/weights \
+    --compare-names "Feature Distill (GRL)" "Multi-scale GRL (GRL)" \
     --weights $WEIGHTS \
     --target-images $TARGET_IMAGES \
     --target-labels $TARGET_LABELS \
@@ -104,8 +118,9 @@ echo "========================================"
 python gradcam_explain.py \
     --weights $WEIGHTS \
     --checkpoints \
-        $RESULTS_DIR/full/weights/best.pt \
-    --names "Full (GRL)" \
+        $RESULTS_DIR/full-feature-distill/weights/best.pt \
+        $RESULTS_DIR/full-multiscale-grl/weights/best.pt \
+    --names "Feature Distill (GRL)" "Multi-scale GRL (GRL)" \
     --images $TARGET_IMAGES \
     --data $DATA \
     --output $RESULTS_DIR/gradcam \
@@ -128,8 +143,9 @@ echo "✅ EigenCAM visualization complete!"
 python detection_diff.py \
     --weights $WEIGHTS \
     --checkpoints \
-        $RESULTS_DIR/full/weights/best.pt \
-    --names "Full (GRL)" \
+        $RESULTS_DIR/full-feature-distill/weights/best.pt \
+        $RESULTS_DIR/full-multiscale-grl/weights/best.pt \
+    --names "Feature Distill (GRL)" "Multi-scale GRL (GRL)" \
     --images $TARGET_IMAGES \
     --labels $TARGET_LABELS \
     --output $RESULTS_DIR/detection_diff \

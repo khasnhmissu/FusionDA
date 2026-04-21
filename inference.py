@@ -228,7 +228,7 @@ def parse_model_output(pred, device):
 
     # YOLO26 eval: có thể trả về [B, N, 4+nc] thay vì [B, 4+nc, N]
     if len(pred_tensor.shape) == 3:
-        if pred_tensor.shape[-1] > pred_tensor.shape[1]:
+        if pred_tensor.shape[1] > pred_tensor.shape[-1]:
             # [B, N, 4+nc] format → transpose sang [B, 4+nc, N]
             pred_tensor = pred_tensor.permute(0, 2, 1)
 
@@ -355,13 +355,20 @@ def run_inference(opt):
         # 5. Parse output
         pred_tensor = parse_model_output(pred_raw, device)
 
-        # 6. NMS
-        detections = non_max_suppression(
-            pred_tensor,
-            conf_thres=opt.conf_thres,
-            iou_thres=opt.iou_thres,
-            max_det=opt.max_det,
-        )
+        # 6. NMS / E2E filter
+        # YOLO26 E2E format [B, N, 6]: đã decoded, chỉ cần filter by confidence
+        if len(pred_tensor.shape) == 3 and pred_tensor.shape[-1] == 6:
+            detections = []
+            for bi in range(pred_tensor.shape[0]):
+                mask = pred_tensor[bi, :, 4] > opt.conf_thres
+                detections.append(pred_tensor[bi, mask])
+        else:
+            detections = non_max_suppression(
+                pred_tensor,
+                conf_thres=opt.conf_thres,
+                iou_thres=opt.iou_thres,
+                max_det=opt.max_det,
+            )
 
         # 7. Process detections cho ảnh này
         det = detections[0]  # Batch size = 1

@@ -254,10 +254,17 @@ def evaluate_checkpoint(model, image_files, label_dir, device, imgsz=640,
         pred_raw = model(img_tensor)
         pred_tensor = parse_model_output(pred_raw, device)
         
-        # NMS
-        detections = non_max_suppression(
-            pred_tensor, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det,
-        )
+        # NMS / E2E filter
+        # YOLO26 E2E format [B, N, 6]: đã decoded, chỉ cần filter by confidence
+        if len(pred_tensor.shape) == 3 and pred_tensor.shape[-1] == 6:
+            detections = []
+            for bi in range(pred_tensor.shape[0]):
+                mask = pred_tensor[bi, :, 4] > conf_thres
+                detections.append(pred_tensor[bi, mask])
+        else:
+            detections = non_max_suppression(
+                pred_tensor, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det,
+            )
         
         det = detections[0]
         if det is not None and len(det) > 0:

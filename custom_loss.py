@@ -437,6 +437,8 @@ class SmallObjectDetectionLoss(v8DetectionLoss):
     def __init__(
         self,
         model,
+        tal_topk:      int   = 10,     # E2ELoss passes this (one2many=10, one2one=7)
+        tal_topk2:     int | None = None,  # E2ELoss passes this (one2one: tal_topk2=1)
         inner_ratio:   float = 0.7,
         use_wise_iou:  bool  = False,
         topk_small:    int   = 20,
@@ -445,7 +447,7 @@ class SmallObjectDetectionLoss(v8DetectionLoss):
         small_thr:     float = 32.0,
         large_thr:     float = 96.0,
     ):
-        super().__init__(model)   # sets up self.bce, self.hyp, strides, etc.
+        super().__init__(model, tal_topk=tal_topk, tal_topk2=tal_topk2)
 
         # --- Replace BboxLoss with Inner-CIoU version ---
         self.bbox_loss = InnerCIoUBboxLoss(

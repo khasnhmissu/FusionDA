@@ -27,6 +27,7 @@ Usage:
 import os
 import csv
 import time
+import warnings
 import json
 from pathlib import Path
 from datetime import datetime
@@ -248,11 +249,17 @@ class TrainingLogger:
     
     def finalize(self):
         """
-        Finalize logging - save all data and close writers.
+        Finalize logging - save all data, generate charts, and close writers.
         Call this at the end of training.
         """
         # Save final CSVs
         self._save_csvs()
+        
+        # Generate loss charts
+        try:
+            self.plot_loss_charts()
+        except Exception as e:
+            print(f"[Logger] Warning: Chart generation failed: {e}")
         
         # Log training duration
         total_time = time.time() - self.start_time
@@ -277,6 +284,187 @@ class TrainingLogger:
             print(f"[Logger] Files:")
             print(f"  - {self.iteration_csv}")
             print(f"  - {self.epoch_csv}")
+            print(f"  - {self.save_dir / 'charts/'}")
+    
+    def plot_loss_charts(self):
+        """
+        Generate and save loss charts as PNG images.
+        
+        Creates:
+        - charts/loss_components.png  — All loss components on one chart (epoch avg)
+        - charts/loss_total.png       — Total loss curve
+        - charts/loss_<name>.png      — Individual loss component charts
+        - charts/metrics.png          — mAP / precision / recall
+        - charts/domain_accuracy.png  — Domain discriminator accuracy (if available)
+        """
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Non-interactive backend
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("[Logger] matplotlib not available. Skipping chart generation.")
+            return
+        
+        warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
+        
+        chart_dir = self.save_dir / 'charts'
+        chart_dir.mkdir(parents=True, exist_ok=True)
+        
+        if not self.iteration_data:
+            print("[Logger] No iteration data to plot.")
+            return
+        
+        # ── Collect per-epoch averages from iteration data ──────────────
+        epoch_avg = defaultdict(lambda: defaultdict(list))
+        for row in self.iteration_data:
+            ep = row.get('epoch', 0)
+            for k, v in row.items():
+                if k.startswith('loss_') and isinstance(v, (int, float)):
+                    epoch_avg[k][ep].append(v)
+        
+        # Compute averages
+        loss_names = sorted(epoch_avg.keys())
+        epochs_set = sorted({row.get('epoch', 0) for row in self.iteration_data})
+        
+        avg_data = {}  # {loss_name: [avg_per_epoch]}
+        for name in loss_names:
+            avgs = []
+            for ep in epochs_set:
+                vals = epoch_avg[name].get(ep, [])
+                avgs.append(sum(vals) / len(vals) if vals else 0.0)
+            avg_data[name] = avgs
+        
+        # ── Chart style ─────────────────────────────────────────────────
+        colors = {
+            'loss_source':      '#2196F3',  # Blue
+            'loss_source_fake': '#4CAF50',  # Green
+            'loss_distill':     '#FF9800',  # Orange
+            'loss_feature_kd':  '#9C27B0',  # Purple
+            'loss_consistency': '#00BCD4',  # Cyan
+            'loss_domain':      '#F44336',  # Red
+            'loss_total':       '#212121',  # Dark
+            'loss_feat_mse':    '#9C27B0',  # Purple (legacy name)
+        }
+        
+        plt.rcParams.update({
+            'figure.facecolor': 'white',
+            'axes.facecolor':   '#FAFAFA',
+            'axes.grid':        True,
+            'grid.alpha':       0.3,
+            'font.size':        11,
+        })
+        
+        # ── 1. Combined loss components chart ───────────────────────────
+        fig, ax = plt.subplots(figsize=(14, 7))
+        for name in loss_names:
+            if name == 'loss_total':
+                continue  # Plot separately
+            color = colors.get(name, None)
+            label = name.replace('loss_', '').replace('_', ' ').title()
+            ax.plot(epochs_set, avg_data[name], label=label, color=color,
+                    linewidth=2, alpha=0.85)
+        
+        ax.set_xlabel('Epoch', fontsize=13)
+        ax.set_ylabel('Loss (epoch average)', fontsize=13)
+        ax.set_title('FusionDA — Loss Components', fontsize=15, fontweight='bold')
+        ax.legend(loc='upper right', fontsize=10, framealpha=0.9)
+        fig.tight_layout()
+        fig.savefig(chart_dir / 'loss_components.png', dpi=150)
+        plt.close(fig)
+        
+        # ── 2. Total loss chart ─────────────────────────────────────────
+        if 'loss_total' in avg_data:
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.plot(epochs_set, avg_data['loss_total'], color=colors['loss_total'],
+                    linewidth=2.5, label='Total Loss')
+            ax.fill_between(epochs_set, avg_data['loss_total'], alpha=0.1,
+                            color=colors['loss_total'])
+            ax.set_xlabel('Epoch', fontsize=13)
+            ax.set_ylabel('Total Loss', fontsize=13)
+            ax.set_title('FusionDA — Total Loss', fontsize=15, fontweight='bold')
+            ax.legend(fontsize=11)
+            fig.tight_layout()
+            fig.savefig(chart_dir / 'loss_total.png', dpi=150)
+            plt.close(fig)
+        
+        # ── 3. Individual loss charts ───────────────────────────────────
+        for name in loss_names:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            color = colors.get(name, '#333333')
+            label = name.replace('loss_', '').replace('_', ' ').title()
+            ax.plot(epochs_set, avg_data[name], color=color, linewidth=2, label=label)
+            ax.fill_between(epochs_set, avg_data[name], alpha=0.1, color=color)
+            ax.set_xlabel('Epoch', fontsize=12)
+            ax.set_ylabel('Loss', fontsize=12)
+            ax.set_title(f'FusionDA — {label} Loss', fontsize=14, fontweight='bold')
+            ax.legend(fontsize=10)
+            fig.tight_layout()
+            fig.savefig(chart_dir / f'{name}.png', dpi=150)
+            plt.close(fig)
+        
+        # ── 4. Metrics chart (mAP, precision, recall) ──────────────────
+        if self.epoch_data:
+            metric_names = ['mAP50', 'mAP50-95', 'precision', 'recall']
+            has_metrics = any(
+                any(m in row for m in metric_names)
+                for row in self.epoch_data
+            )
+            if has_metrics:
+                fig, ax = plt.subplots(figsize=(12, 6))
+                metric_colors = {
+                    'mAP50':     '#2196F3',
+                    'mAP50-95':  '#FF9800',
+                    'precision': '#4CAF50',
+                    'recall':    '#F44336',
+                }
+                for m in metric_names:
+                    vals = [row.get(m, None) for row in self.epoch_data]
+                    eps  = [row.get('epoch', i) for i, row in enumerate(self.epoch_data)]
+                    # Filter out None values
+                    filtered = [(e, v) for e, v in zip(eps, vals) if v is not None]
+                    if filtered:
+                        e_list, v_list = zip(*filtered)
+                        ax.plot(e_list, v_list, label=m, color=metric_colors.get(m),
+                                linewidth=2.5 if 'mAP' in m else 1.8,
+                                marker='o' if 'mAP' in m else None,
+                                markersize=5)
+                
+                ax.set_xlabel('Epoch', fontsize=13)
+                ax.set_ylabel('Score', fontsize=13)
+                ax.set_title('FusionDA — Validation Metrics', fontsize=15, fontweight='bold')
+                ax.set_ylim(0, 1.05)
+                ax.legend(loc='lower right', fontsize=11, framealpha=0.9)
+                fig.tight_layout()
+                fig.savefig(chart_dir / 'metrics.png', dpi=150)
+                plt.close(fig)
+        
+        # ── 5. Domain accuracy chart ───────────────────────────────────
+        domain_acc_data = defaultdict(list)
+        for row in self.iteration_data:
+            ep = row.get('epoch', 0)
+            da = row.get('domain_acc', None)
+            if da is not None and isinstance(da, (int, float)):
+                domain_acc_data[ep].append(da)
+        
+        if domain_acc_data:
+            da_epochs = sorted(domain_acc_data.keys())
+            da_avgs = [sum(domain_acc_data[e]) / len(domain_acc_data[e]) for e in da_epochs]
+            
+            fig, ax = plt.subplots(figsize=(12, 6))
+            ax.plot(da_epochs, da_avgs, color='#E91E63', linewidth=2, label='Domain Accuracy')
+            ax.axhline(y=0.5, color='gray', linestyle='--', linewidth=1, alpha=0.7, label='Target (0.5)')
+            ax.fill_between(da_epochs, da_avgs, 0.5, alpha=0.1, color='#E91E63')
+            ax.set_xlabel('Epoch', fontsize=13)
+            ax.set_ylabel('Accuracy', fontsize=13)
+            ax.set_title('FusionDA — Domain Discriminator Accuracy', fontsize=15, fontweight='bold')
+            ax.set_ylim(0, 1.05)
+            ax.legend(fontsize=11)
+            fig.tight_layout()
+            fig.savefig(chart_dir / 'domain_accuracy.png', dpi=150)
+            plt.close(fig)
+        
+        n_charts = len(loss_names) + 3  # components + total + metrics + domain_acc
+        print(f"[Logger] 📊 Saved {n_charts} charts to {chart_dir}")
     
     def __del__(self):
         """Cleanup on deletion."""

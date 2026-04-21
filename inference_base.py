@@ -360,13 +360,20 @@ def run_inference(opt):
         # 5. Parse output
         pred_tensor = parse_model_output(pred_raw, device)
 
-        # 6. NMS
-        detections = non_max_suppression(
-            pred_tensor,
-            conf_thres=opt.conf_thres,
-            iou_thres=opt.iou_thres,
-            max_det=opt.max_det,
-        )
+        # 6. NMS / E2E filter
+        # YOLO26 E2E format [B, N, 6]: đã decoded, chỉ cần filter by confidence
+        if len(pred_tensor.shape) == 3 and pred_tensor.shape[-1] == 6:
+            detections = []
+            for bi in range(pred_tensor.shape[0]):
+                mask = pred_tensor[bi, :, 4] > opt.conf_thres
+                detections.append(pred_tensor[bi, mask])
+        else:
+            detections = non_max_suppression(
+                pred_tensor,
+                conf_thres=opt.conf_thres,
+                iou_thres=opt.iou_thres,
+                max_det=opt.max_det,
+            )
 
         # 7. Process detections cho ảnh này
         det = detections[0]  # Batch size = 1

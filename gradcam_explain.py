@@ -140,59 +140,50 @@ def preprocess(img_path, imgsz=640, device=None):
 # Detection parsing — YOLO26s output: [1, num_anchors, 4+nc] or [1, 4+nc, anchors]
 # ==============================================================================
 
-def parse_detections(preds, conf_thresh=0.25, nc=None):
+def _parse_single_tensor(pred_tensor, conf_thresh=0.25, nc=None):
     """
-    Parse YOLO raw predictions thành list of (x1,y1,x2,y2,conf,cls_id).
-    Handles both xywh và xyxy, and both output shapes.
-
-    YOLO26s ultralytics output thường là tensor [1, 4+nc, num_anchors].
+    Parse một tensor prediction đơn thành list detections.
+    Hỗ trợ shape [1, 4+nc, N] hoặc [1, N, 4+nc].
     """
-    if isinstance(preds, (list, tuple)):
-        preds = preds[0]
-    if not isinstance(preds, torch.Tensor):
+    if not isinstance(pred_tensor, torch.Tensor):
         return [], {}
 
-    if preds.dim() == 3:
-        # Shape [1, 4+nc, num_anchors] → transpose → [1, num_anchors, 4+nc]
-        if preds.shape[1] < preds.shape[2]:
-            # shape [1, 4+nc, N] → already rows=classes
-            pred = preds[0]  # [4+nc, N]
+    if pred_tensor.dim() == 3:
+        if pred_tensor.shape[1] < pred_tensor.shape[2]:
+            pred = pred_tensor[0]      # [4+nc, N]
         else:
-            # shape [1, N, 4+nc]
-            pred = preds[0].T  # [4+nc, N]
-    elif preds.dim() == 2:
-        pred = preds.T if preds.shape[0] < preds.shape[1] else preds
+            pred = pred_tensor[0].T    # [4+nc, N]
+    elif pred_tensor.dim() == 2:
+        pred = pred_tensor.T if pred_tensor.shape[0] < pred_tensor.shape[1] else pred_tensor
     else:
         return [], {}
 
-    # pred shape: [4+nc, N]
-    boxes_xywh = pred[:4, :]   # [4, N]
-    class_scores = pred[4:, :]  # [nc, N]
+    boxes_xywh = pred[:4, :]
+    class_scores = pred[4:, :]
 
     if nc is None:
         nc = class_scores.shape[0]
+    if nc <= 0 or class_scores.shape[0] != nc:
+        return [], {}
 
-    # Convert xywh → xyxy
     cx, cy, w_box, h_box = boxes_xywh[0], boxes_xywh[1], boxes_xywh[2], boxes_xywh[3]
     x1 = cx - w_box / 2
     y1 = cy - h_box / 2
     x2 = cx + w_box / 2
     y2 = cy + h_box / 2
 
-    # Determine conf
     if class_scores.max() > 1.0 or class_scores.min() < 0.0:
         class_scores_prob = torch.sigmoid(class_scores)
     else:
         class_scores_prob = class_scores
 
-    max_scores, max_cls = torch.max(class_scores_prob, dim=0)  # [N]
-
+    max_scores, max_cls = torch.max(class_scores_prob, dim=0)
     mask = max_scores > conf_thresh
+
     detections = []
     class_detection_count = {}
-
-    for i in range(mask.sum().item()):
-        idx = mask.nonzero(as_tuple=False).squeeze(1)[i].item()
+    for idx in mask.nonzero(as_tuple=False).squeeze(1):
+        idx = idx.item()
         cls_id = int(max_cls[idx].item())
         conf = float(max_scores[idx].item())
         box = (float(x1[idx].item()), float(y1[idx].item()),
@@ -201,6 +192,43 @@ def parse_detections(preds, conf_thresh=0.25, nc=None):
         class_detection_count[cls_id] = class_detection_count.get(cls_id, 0) + 1
 
     return detections, class_detection_count
+
+
+def parse_detections(preds, conf_thresh=0.25, nc=None):
+    """
+    Parse YOLO raw predictions thành list of (x1,y1,x2,y2,conf,cls_id).
+
+    YOLO26 end-to-end dual output: (one2one, one2many).
+    Code thử cả hai candidates và lấy output có nhiều detections nhất
+    → class-discriminative EigenCAM có đủ box để build heatmap tốt.
+    """
+    # Collect candidate tensors
+    candidates = []
+    if isinstance(preds, (list, tuple)):
+        for item in preds[:2]:  # check tối đa 2 outputs
+            if isinstance(item, (list, tuple)):
+                item = item[0] if len(item) > 0 else None
+            if isinstance(item, torch.Tensor):
+                candidates.append(item)
+    elif isinstance(preds, torch.Tensor):
+        candidates = [preds]
+    else:
+        return [], {}
+
+    if not candidates:
+        return [], {}
+
+    # Parse từng candidate, lấy cái có nhiều detection nhất
+    best_dets, best_cls = [], {}
+    for tensor in candidates:
+        try:
+            dets, cls_counts = _parse_single_tensor(tensor, conf_thresh, nc)
+            if sum(cls_counts.values()) > sum(best_cls.values()):
+                best_dets, best_cls = dets, cls_counts
+        except Exception:
+            continue
+
+    return best_dets, best_cls
 
 
 # ==============================================================================
@@ -224,10 +252,9 @@ class YOLO26EigenCAM:
         self.features = None
         self.hook = None
 
-        # Auto-detect layer nếu không chỉ định
+        # Auto-detect optimal layer: neck output trước Detect head (tốt hơn backbone end)
         if target_layer_idx is None or target_layer_idx < 0:
-            target_layer_idx = find_last_backbone_layer(model)
-            print(f"[EigenCAM] Auto-detected backbone end layer: {target_layer_idx}")
+            target_layer_idx = self._find_pre_detect_layer(model)
 
         # Register hook
         layers = self._get_layers(model)
@@ -251,6 +278,54 @@ class YOLO26EigenCAM:
         except Exception:
             return None
 
+    def _find_pre_detect_layer(self, model):
+        """
+        Tìm layer tối ưu cho EigenCAM: C2f/Conv CUỐI CÙNG trong neck trước Detect head.
+
+        Tại sao neck > backbone end:
+        - Neck features đã FPN/PAN-fused → object-specific, background bị suppress
+        - Backbone-end (C2PSA) vẫn chứa texture/background signal mạnh
+        - Pre-Detect C2f có balance tốt nhất giữa semantic và spatial resolution
+        """
+        layers = self._get_layers(model)
+        if layers is None:
+            result = find_last_backbone_layer(model)
+            print(f"[EigenCAM] Cannot resolve layers → fallback backbone layer {result}")
+            return result
+
+        # Tìm Detect head index
+        detect_idx = -1
+        for idx, layer in enumerate(layers):
+            if layer.__class__.__name__ == 'Detect':
+                detect_idx = idx
+                break
+
+        if detect_idx <= 0:
+            result = find_last_backbone_layer(model)
+            print(f"[EigenCAM] No Detect head found → fallback backbone layer {result}")
+            return result
+
+        # Lấy C2f/Conv CUỐI CÙNG trước Detect
+        meaningful = {'C2f', 'C2', 'C2PSA', 'C3', 'C3Ghost', 'Conv', 'RepC3'}
+        best_idx = -1
+        for idx, layer in enumerate(layers):
+            if idx >= detect_idx:
+                break
+            if layer.__class__.__name__ in meaningful:
+                best_idx = idx
+
+        if best_idx < 0:
+            result = find_last_backbone_layer(model)
+            print(f"[EigenCAM] No neck C2f found → fallback backbone layer {result}")
+            return result
+
+        print(
+            f"[EigenCAM] Detect@layer{detect_idx} | "
+            f"Hooking pre-Detect layer {best_idx} "
+            f"({layers[best_idx].__class__.__name__}) — neck output"
+        )
+        return best_idx
+
     def _hook_fn(self, module, input, output):
         self.features = output.detach()
 
@@ -272,7 +347,13 @@ class YOLO26EigenCAM:
         except np.linalg.LinAlgError:
             cam = feat_2d.mean(axis=0).reshape(H, W)
 
-        # Clamp negative (chỉ giữ positive activations — quan trọng cho heatmap đỏ)
+        # FIX Bug #1: SVD sign ambiguity
+        # numpy SVD có thể trả về Vt[0] với dấu âm (mathematically equivalent)
+        # Nếu |min| > |max| → principal component bị inverted → flip để object = dương
+        if cam.size > 0 and abs(cam.min()) > abs(cam.max()):
+            cam = -cam
+
+        # Clamp negative (giữ positive activations — vùng object)
         cam = np.maximum(cam, 0)
         cam_min, cam_max = cam.min(), cam.max()
         if cam_max > cam_min:
@@ -313,18 +394,24 @@ class YOLO26EigenCAM:
         if feat_in_box.shape[1] < 2:
             return self._compute_eigencam_full(feat)
 
-        # Center
-        feat_in_box = feat_in_box - feat_in_box.mean(axis=1, keepdims=True)
+        # FIX Bug #3: center in-box features, lưu in_box_mean để dùng lại
+        in_box_mean = feat_in_box.mean(axis=1, keepdims=True)  # [C, 1]
+        feat_in_box_c = feat_in_box - in_box_mean
 
         try:
-            U, S, Vt = np.linalg.svd(feat_in_box, full_matrices=False)
-            # Project first principal component back to full spatial space
+            U, S, Vt = np.linalg.svd(feat_in_box_c, full_matrices=False)
+            # FIX Bug #3: center feat_2d bằng CÙNG in-box mean trước khi project
+            # → loại bỏ bias, pixel outside box không bị over-activate
+            feat_2d_c = feat_2d - in_box_mean  # [C, H*W]
             first_pc = U[:, 0]  # [C]
-            cam_flat = feat_2d.T @ first_pc  # [H_feat*W_feat]
+            cam_flat = feat_2d_c.T @ first_pc   # [H_feat*W_feat]
             cam = cam_flat.reshape(H_feat, W_feat)
         except np.linalg.LinAlgError:
-            cam = feat_in_box.mean(axis=0).reshape(H_feat, W_feat) if False else \
-                feat_2d.mean(axis=0).reshape(H_feat, W_feat)
+            cam = feat_2d.mean(axis=0).reshape(H_feat, W_feat)
+
+        # FIX Bug #1: SVD sign ambiguity
+        if cam.size > 0 and abs(cam.min()) > abs(cam.max()):
+            cam = -cam
 
         # Clamp negative
         cam = np.maximum(cam, 0)
@@ -335,41 +422,41 @@ class YOLO26EigenCAM:
 
     def forward(self, img_tensor, pad_info=None):
         """
-        Chạy forward pass và trả về (heatmap_full, raw_preds).
-        heatmap_full: standard EigenCAM [H, W] ∈ [0,1]
+        Chạy forward pass và trả về (heatmap_full, raw_preds, cached_feat).
+        cached_feat: numpy [C,H,W] — truyền vào forward_class() để tránh forward pass thứ 2.
         """
         self.model.eval()
         with torch.no_grad():
             preds = self.model(img_tensor)
 
         if self.features is None:
-            return np.zeros((img_tensor.shape[2], img_tensor.shape[3])), preds
+            return np.zeros((img_tensor.shape[2], img_tensor.shape[3])), preds, None
 
-        feat = self.features[0].cpu().numpy()  # [C, H_feat, W_feat]
+        feat = self.features[0].cpu().numpy()  # [C, H_feat, W_feat] — cache này!
         cam = self._compute_eigencam_full(feat)
 
-        # Resize to input size
         img_h, img_w = img_tensor.shape[2], img_tensor.shape[3]
         cam_resized = cv2.resize(cam.astype(np.float32), (img_w, img_h))
-
-        # Mask padding
         cam_resized = self._mask_padding(cam_resized, pad_info, img_h, img_w)
-        return cam_resized, preds
+        return cam_resized, preds, feat  # FIX Bug #5: trả về feat để tái dùng
 
-    def forward_class(self, img_tensor, pad_info, detections, class_id, img_h_orig, img_w_orig):
+    def forward_class(self, img_tensor, pad_info, detections, class_id,
+                      img_h_orig, img_w_orig, cached_feat=None):
         """
         Class-Discriminative EigenCAM cho một class cụ thể.
-        detections: list of (x1,y1,x2,y2,conf,cls_id) trong coordinate của img_tensor (pixel)
+        detections  : list of (x1,y1,x2,y2,conf,cls_id) — pixel coords của img_tensor
+        cached_feat : numpy [C,H,W] từ forward() để tránh chạy model lại (Bug #5 fix)
         """
-        self.model.eval()
-        with torch.no_grad():
-            preds = self.model(img_tensor)
-
-        if self.features is None:
-            return np.zeros((img_tensor.shape[2], img_tensor.shape[3]))
-
-        feat = self.features[0].cpu().numpy()  # [C, H_feat, W_feat]
-        C, H_feat, W_feat = feat.shape
+        # FIX Bug #5: dùng cached features nếu có, KHÔNG chạy forward pass thứ 2
+        if cached_feat is not None:
+            feat = cached_feat
+        else:
+            self.model.eval()
+            with torch.no_grad():
+                self.model(img_tensor)
+            if self.features is None:
+                return np.zeros((img_tensor.shape[2], img_tensor.shape[3]))
+            feat = self.features[0].cpu().numpy()
 
         img_h, img_w = img_tensor.shape[2], img_tensor.shape[3]
 
@@ -378,7 +465,6 @@ class YOLO26EigenCAM:
         for det in detections:
             if len(det) >= 6 and int(det[5]) == class_id:
                 x1, y1, x2, y2 = det[:4]
-                # Normalize bằng input tensor size
                 boxes_norm.append((
                     max(0.0, x1 / img_w),
                     max(0.0, y1 / img_h),
@@ -732,8 +818,8 @@ def run(opt):
             img_rgb, img_lb, pad_info, tensor = preprocess(img_path, opt.imgsz, device)
             img_h_tensor, img_w_tensor = tensor.shape[2], tensor.shape[3]
 
-            # Forward (standard EigenCAM for single-image visualization)
-            heatmap_full, preds = eigencam.forward(tensor, pad_info=pad_info)
+            # Forward (standard EigenCAM) — FIX Bug #5: lấy cached_feat luôn
+            heatmap_full, preds, cached_feat = eigencam.forward(tensor, pad_info=pad_info)
             heatmaps.append(heatmap_full)
 
             # Parse detections
@@ -750,9 +836,11 @@ def run(opt):
             if opt.global_heatmap and detections:
                 present_classes = set(int(d[5]) for d in detections)
                 for cls_id in present_classes:
+                    # FIX Bug #5: truyền cached_feat → không chạy forward pass thứ 2
                     cam_cls = eigencam.forward_class(
                         tensor, pad_info, detections, cls_id,
-                        img_h_tensor, img_w_tensor
+                        img_h_tensor, img_w_tensor,
+                        cached_feat=cached_feat
                     )
                     if cls_id not in heatmap_sums_cls:
                         heatmap_sums_cls[cls_id] = np.zeros_like(cam_cls)

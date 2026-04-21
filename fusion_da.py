@@ -39,8 +39,8 @@ class WeightEMA(nn.Module):
             alpha: float = 0.999,
             freeze_teacher: bool = False,
             device: Optional[torch.device] = None,
-            update_after_step: int = 2000,      # Delay EMA updates (was 500)
-            alpha_rampup_steps: int = 5000,      # Cosine ramp-up period
+            update_after_step: int = 500,       # Delay EMA updates
+            alpha_rampup_steps: int = 2000,      # Cosine ramp-up period
     ):
         super().__init__()
         
@@ -76,7 +76,7 @@ class WeightEMA(nn.Module):
         if freeze_teacher:
             print(f"[WeightEMA] FREEZE: Teacher stays pretrained")
         else:
-            print(f"[WeightEMA] alpha={alpha}, {n_params} params (EMA), {n_buffers} buffers (frozen)")
+            print(f"[WeightEMA] alpha={alpha}, {n_params} params (EMA), {n_buffers} buffers (EMA, slow-updated)")
             print(f"[WeightEMA] EMA updates start after step {update_after_step}")
             print(f"[WeightEMA] Alpha ramp-up over {alpha_rampup_steps} steps after delay")
     
@@ -166,12 +166,19 @@ class PairedMultiDomainDataset(torch.utils.data.Dataset):
     """
     
     def __init__(self, source_real_path, source_fake_path, target_real_path, target_fake_path,
-                 imgsz=640, augment=False, hyp=None, data=None, stride=32):
+                 imgsz=640, augment=False, hyp=None, data=None, stride=32,
+                 copy_paste_small=False, copy_paste_max_copies=3, copy_paste_small_thr=32.0):
         from ultralytics.data.dataset import YOLODataset
         from pathlib import Path
         
         self.imgsz = imgsz
         self.augment = augment
+        self.copy_paste_small = copy_paste_small
+        self.copy_paste_max_copies = copy_paste_max_copies
+        self.copy_paste_small_thr = copy_paste_small_thr
+        
+        if copy_paste_small:
+            print(f'[PairedDataset] CopyPaste-Small enabled: thr={copy_paste_small_thr}px, max_copies={copy_paste_max_copies}')
         
         dataset_args = {
             'imgsz': imgsz, 'augment': augment, 'cache': False,
@@ -224,6 +231,20 @@ class PairedMultiDomainDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         source_real = self.source_real_ds[idx]
         source_fake = self._get_matched_item(self.source_real_ds, idx, self.source_fake_ds, self.source_fake_file_to_idx)
+        
+        # Copy-paste small objects for source data (has GT labels)
+        if self.copy_paste_small:
+            from utils.copy_paste_small import apply_small_copy_paste
+            source_real = apply_small_copy_paste(
+                source_real,
+                small_thr=self.copy_paste_small_thr,
+                max_copies=self.copy_paste_max_copies,
+            )
+            source_fake = apply_small_copy_paste(
+                source_fake,
+                small_thr=self.copy_paste_small_thr,
+                max_copies=self.copy_paste_max_copies,
+            )
         
         target_idx = idx % len(self.target_real_ds) if self.target_real_ds else idx
         target_real = self.target_real_ds[target_idx] if self.target_real_ds else source_real
@@ -318,6 +339,9 @@ class FDALoss:
         box_gain:  float = 7.5,
         cls_gain:  float = 0.5,
         dfl_gain:  float = 1.5,   # v8DetectionLoss bắt buộc có hyp.dfl
+        use_small_object_loss: bool = False,
+        inner_ratio:  float = 0.7,
+        use_wise_iou: bool  = False,
     ):
         from ultralytics.utils import IterableSimpleNamespace
 
@@ -337,9 +361,41 @@ class FDALoss:
 
         model.args = hyp
 
-        self.detection_loss = _DetLoss(model)   # E2ELoss (YOLO26) hoặc v8DetectionLoss (YOLOv8)
+        # Select detection loss function
+        if use_small_object_loss:
+            from functools import partial
+            from custom_loss import SmallObjectDetectionLoss
+            loss_fn = partial(
+                SmallObjectDetectionLoss,
+                inner_ratio=inner_ratio,
+                use_wise_iou=use_wise_iou,
+            )
+            print(f'[FDALoss] Using SmallObjectDetectionLoss '
+                  f'(inner_ratio={inner_ratio}, wise_iou={use_wise_iou})')
+        else:
+            from ultralytics.utils.loss import v8DetectionLoss
+            loss_fn = v8DetectionLoss
+
+        if _IS_E2E:
+            from ultralytics.utils.loss import E2ELoss
+            self.detection_loss = E2ELoss(model, loss_fn=loss_fn)
+        else:
+            self.detection_loss = loss_fn(model)
         self.detection_loss.hyp = hyp
         self.device = next(model.parameters()).device
+        
+        # Separate single-head loss for distillation (one2many only).
+        # E2ELoss trains both one2many + one2one heads, which doubles
+        # noise amplification from pseudo-labels. For distillation,
+        # only use v8DetectionLoss on one2many predictions.
+        if _IS_E2E:
+            from ultralytics.utils.loss import v8DetectionLoss as _V8Loss
+            self.distill_loss = _V8Loss(model)
+            self.distill_loss.hyp = hyp
+            self._is_e2e = True
+        else:
+            self.distill_loss = self.detection_loss
+            self._is_e2e = False
     
     def __call__(self, preds, batch):
         result = self.detection_loss(preds, batch)
@@ -357,7 +413,11 @@ class FDALoss:
         return loss, loss_items
     
     def compute_distillation_loss(self, student_preds, pseudo_targets, img_shape):
-        """Compute loss using pseudo-labels from teacher."""
+        """Compute loss using pseudo-labels from teacher.
+        
+        Uses v8DetectionLoss (one2many head only) instead of full E2ELoss
+        to avoid double-head noise amplification from noisy pseudo-labels.
+        """
         if pseudo_targets is None or len(pseudo_targets) == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
@@ -366,7 +426,13 @@ class FDALoss:
         if batch['cls'].numel() == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        loss, _ = self.detection_loss(student_preds, batch)
+        # For E2E models: extract one2many predictions only (skip one2one)
+        if self._is_e2e and isinstance(student_preds, dict) and 'one2many' in student_preds:
+            preds = student_preds['one2many']
+        else:
+            preds = student_preds
+        
+        loss, _ = self.distill_loss(preds, batch)
         return loss
     
     def _format_pseudo_targets(self, pseudo_labels_list, img_shape):
