@@ -157,106 +157,167 @@ class WeightEMA(nn.Module):
 
 
 class PairedMultiDomainDataset(torch.utils.data.Dataset):
+    """4-domain dataset with augmentation-synced pairs.
+
+    Pairs:
+      - source pair: source_real ↔ source_fake (same scene, fog added to fake)
+      - target pair: target_real ↔ target_fake (same scene, style transferred)
+
+    Inside each pair the two sides receive IDENTICAL mosaic / flip / scale /
+    crop augmentation via PairedAugDataset's RNG-seed synchronisation. Cross
+    pair seeds are independent, so the source pair and target pair pick
+    different augmentations — which is what DA training wants.
+
+    This replaces the old design where each of 4 domains was an independent
+    YOLODataset: mosaic picked different partners per side, flip decided
+    independently → paired losses (consistency, distillation, paired
+    source_fake detection) were operating on spatially mis-aligned tensors.
     """
-    Dataset loading 4 matched images: source_real, source_fake, target_real, target_fake.
-    
-    Matching by filename ensures:
-    - Consistency Loss: source_real ↔ source_fake (same scene)
-    - Distillation: target_real ↔ target_fake (same scene)
-    """
-    
-    def __init__(self, source_real_path, source_fake_path, target_real_path, target_fake_path,
+
+    def __init__(self, source_real_path, source_fake_path,
+                 target_real_path, target_fake_path,
                  imgsz=640, augment=False, hyp=None, data=None, stride=32,
-                 copy_paste_small=False, copy_paste_max_copies=3, copy_paste_small_thr=32.0):
+                 copy_paste_small=False, copy_paste_max_copies=3,
+                 copy_paste_small_thr=32.0):
         from ultralytics.data.dataset import YOLODataset
-        from pathlib import Path
-        
+        from utils.paired_dataset import PairedAugDataset
+
         self.imgsz = imgsz
         self.augment = augment
         self.copy_paste_small = copy_paste_small
         self.copy_paste_max_copies = copy_paste_max_copies
         self.copy_paste_small_thr = copy_paste_small_thr
-        
+
         if copy_paste_small:
-            print(f'[PairedDataset] CopyPaste-Small enabled: thr={copy_paste_small_thr}px, max_copies={copy_paste_max_copies}')
-        
+            print(
+                f'[PairedDataset] CopyPaste-Small enabled on source_real only: '
+                f'thr={copy_paste_small_thr}px, max_copies={copy_paste_max_copies}. '
+                f'(source_fake skipped to preserve pair alignment.)'
+            )
+
+        # rect=True is fine for paired alignment because twin datasets
+        # with identical filenames + identical image dimensions sort to the
+        # same order and compute identical batch_shapes. PairedAugDataset
+        # asserts this explicitly at init; if dims ever drift the assertion
+        # will trip with a clear error instead of silently mis-pairing.
+        # rect=True cuts activation memory ~30-40% vs rect=False (batches
+        # letterboxed to median aspect instead of square 1024×1024),
+        # which matters when we already run 3 student forwards + 1
+        # teacher forward per iter.
         dataset_args = {
             'imgsz': imgsz, 'augment': augment, 'cache': False,
             'hyp': hyp, 'data': data, 'task': 'detect', 'stride': stride,
             'rect': True, 'single_cls': False, 'pad': 0.5, 'classes': None,
         }
-        
-        self.source_real_ds = YOLODataset(img_path=source_real_path, **dataset_args)
-        self.source_fake_ds = YOLODataset(img_path=source_fake_path, **dataset_args) if source_fake_path else None
-        self.target_real_ds = YOLODataset(img_path=target_real_path, **dataset_args) if target_real_path else None
-        self.target_fake_ds = YOLODataset(img_path=target_fake_path, **dataset_args) if target_fake_path else None
-        
-        # Build filename → index mappings
-        self.source_real_file_to_idx = self._build_file_index(self.source_real_ds)
-        self.source_fake_file_to_idx = self._build_file_index(self.source_fake_ds) if self.source_fake_ds else {}
-        self.target_real_file_to_idx = self._build_file_index(self.target_real_ds) if self.target_real_ds else {}
-        self.target_fake_file_to_idx = self._build_file_index(self.target_fake_ds) if self.target_fake_ds else {}
-        
-        self.n = len(self.source_real_ds)
-        self._log_matching_stats()
-    
-    def _build_file_index(self, dataset):
-        from pathlib import Path
-        if dataset is None:
-            return {}
-        return {Path(f).stem: i for i, f in enumerate(dataset.im_files)}
-    
-    def _log_matching_stats(self):
-        sr = set(self.source_real_file_to_idx.keys())
-        sf = set(self.source_fake_file_to_idx.keys())
-        tr = set(self.target_real_file_to_idx.keys())
-        tf = set(self.target_fake_file_to_idx.keys())
-        print(f"[PairedDataset] Source: {len(sr)} real, {len(sf)} fake, {len(sr & sf)} matched")
-        print(f"[PairedDataset] Target: {len(tr)} real, {len(tf)} fake, {len(tr & tf)} matched")
-    
-    def _get_matched_item(self, primary_ds, primary_idx, other_ds, other_idx_map):
-        if other_ds is None or not other_idx_map:
-            return primary_ds[primary_idx]
-        
-        from pathlib import Path
-        filename = Path(primary_ds.im_files[primary_idx]).stem
-        
-        if filename in other_idx_map:
-            return other_ds[other_idx_map[filename]]
-        return other_ds[primary_idx % len(other_ds)]
-    
+
+        # ── Source pair ────────────────────────────────────────────────
+        if source_fake_path:
+            self.source_pair = PairedAugDataset(
+                real_path=source_real_path,
+                fake_path=source_fake_path,
+                **dataset_args,
+            )
+            self.source_real_ds = None
+            self._source_n = len(self.source_pair)
+        else:
+            self.source_pair = None
+            self.source_real_ds = YOLODataset(img_path=source_real_path, **dataset_args)
+            self._source_n = len(self.source_real_ds)
+
+        # ── Target pair ────────────────────────────────────────────────
+        if target_real_path and target_fake_path:
+            self.target_pair = PairedAugDataset(
+                real_path=target_real_path,
+                fake_path=target_fake_path,
+                **dataset_args,
+            )
+            self.target_real_ds = None
+            self._target_n = len(self.target_pair)
+        elif target_real_path:
+            self.target_pair = None
+            self.target_real_ds = YOLODataset(img_path=target_real_path, **dataset_args)
+            self._target_n = len(self.target_real_ds)
+        else:
+            self.target_pair = None
+            self.target_real_ds = None
+            self._target_n = 0
+
+        self.n = self._source_n
+
     def __len__(self):
         return self.n
-    
+
     def __getitem__(self, idx):
-        source_real = self.source_real_ds[idx]
-        source_fake = self._get_matched_item(self.source_real_ds, idx, self.source_fake_ds, self.source_fake_file_to_idx)
-        
-        # Copy-paste small objects for source data (has GT labels)
+        # ── Source pair ────────────────────────────────────────────────
+        if self.source_pair is not None:
+            src = self.source_pair[idx]
+            source_real = src['real']
+            source_fake = src['fake']
+        else:
+            source_real = self.source_real_ds[idx]
+            source_fake = source_real  # fallback when no fake side exists
+
+        # Copy-paste small — apply to BOTH source_real and source_fake with
+        # the SAME seed so every random decision (target position, scale,
+        # flip, object index, prob check) is identical. BOTH calls also
+        # receive source_real's pristine image as the crop source, so the
+        # pasted object pixels are always extracted from the CLEAR
+        # Cityscapes domain (clean detail, no fog noise). Each call then
+        # colour-matches those clear pixels to its own destination palette:
+        #   source_real destination (clear) → minor colour shift, stays clear
+        #   source_fake destination (foggy) → shift toward fog tones, blends in
+        # Result: both pair members get the SAME object at the SAME position
+        # with clean geometric features, just rendered in their own domain's
+        # palette → pair-pixel alignment preserved and consistency loss
+        # remains valid.
         if self.copy_paste_small:
+            import random as _random
             from utils.copy_paste_small import apply_small_copy_paste
+            cp_seed = _random.randint(0, 2**31 - 1)
+
+            # Snapshot source_real's image BEFORE the first paste — used as
+            # the pristine CLEAR crop source for both twin calls.
+            clear_src_img = source_real['img']
+            if isinstance(clear_src_img, torch.Tensor):
+                clear_src_img = clear_src_img.clone()
+            else:
+                clear_src_img = clear_src_img.copy()
+
             source_real = apply_small_copy_paste(
                 source_real,
                 small_thr=self.copy_paste_small_thr,
                 max_copies=self.copy_paste_max_copies,
+                seed=cp_seed,
+                source_image=clear_src_img,
             )
-            source_fake = apply_small_copy_paste(
-                source_fake,
-                small_thr=self.copy_paste_small_thr,
-                max_copies=self.copy_paste_max_copies,
-            )
-        
-        target_idx = idx % len(self.target_real_ds) if self.target_real_ds else idx
-        target_real = self.target_real_ds[target_idx] if self.target_real_ds else source_real
-        target_fake = self._get_matched_item(
-            self.target_real_ds, target_idx, self.target_fake_ds, self.target_fake_file_to_idx
-        ) if self.target_real_ds else source_fake
-        
+            if self.source_pair is not None:
+                source_fake = apply_small_copy_paste(
+                    source_fake,
+                    small_thr=self.copy_paste_small_thr,
+                    max_copies=self.copy_paste_max_copies,
+                    seed=cp_seed,
+                    source_image=clear_src_img,
+                )
+
+        # ── Target pair ────────────────────────────────────────────────
+        if self.target_pair is not None:
+            tgt_idx = idx % self._target_n
+            tgt = self.target_pair[tgt_idx]
+            target_real = tgt['real']
+            target_fake = tgt['fake']
+        elif self.target_real_ds is not None:
+            tgt_idx = idx % self._target_n
+            target_real = self.target_real_ds[tgt_idx]
+            target_fake = target_real
+        else:
+            target_real = source_real
+            target_fake = source_fake
+
         return {
             'source_real': source_real, 'source_fake': source_fake,
             'target_real': target_real, 'target_fake': target_fake,
         }
-    
+
     @staticmethod
     def collate_fn(batch):
         from ultralytics.data.dataset import YOLODataset
