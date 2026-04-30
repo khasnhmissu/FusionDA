@@ -4,7 +4,7 @@ model:
   imgsz: 640
 
 data:
-  config: "data.yaml"
+  config: "configs/data/data.yaml"
   workers: 8
   batch_size: 4
 

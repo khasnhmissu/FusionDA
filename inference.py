@@ -480,7 +480,7 @@ Output format (mỗi file .txt):
                         help='Dùng FP16 inference')
 
     # Class names
-    parser.add_argument('--class-names', type=str, default='data.yaml',
+    parser.add_argument('--class-names', type=str, default='configs/data/data.yaml',
                         help='YAML file chứa class names (default: data.yaml)')
 
     return parser.parse_args()

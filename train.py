@@ -498,8 +498,8 @@ def train(opt):
         if getattr(opt, 'eval_source', False) or baseline_mode:
             _ = validate_model(
                 tag='STUDENT-INIT', state_dict=model_student.state_dict(),
-                weights_path=opt.weights, data_yaml='data_clear.yaml', split='test',
-                device=device, dataset_label='source_real (data_clear.yaml)',
+                weights_path=opt.weights, data_yaml='configs/data/data_clear.yaml', split='test',
+                device=device, dataset_label='source_real (configs/data/data_clear.yaml)',
             )
     except Exception as e:
         LOGGER.warning(f'[BASELINE] validation skipped: {e}')
@@ -1261,8 +1261,8 @@ def train(opt):
                     try:
                         metrics_src = validate_model(
                             tag='STUDENT', state_dict=model_student.state_dict(),
-                            weights_path=opt.weights, data_yaml='data_clear.yaml', split='test',
-                            device=device, dataset_label='source_real (data_clear.yaml)',
+                            weights_path=opt.weights, data_yaml='configs/data/data_clear.yaml', split='test',
+                            device=device, dataset_label='source_real (configs/data/data_clear.yaml)',
                         )
                         source_map50 = metrics_src.box.map50
                     except Exception as e:
@@ -1409,7 +1409,7 @@ def parse_args():
     # Model
     parser.add_argument('--cfg', type=str, default=None, help='custom model.yaml file (e.g. yolov8-p2.yaml)')
     parser.add_argument('--weights', type=str, default='yolo26s.pt')
-    parser.add_argument('--data', type=str, default='data_v8.yaml')
+    parser.add_argument('--data', type=str, default='configs/data/data.yaml')
     parser.add_argument('--imgsz', type=int, default=1024)
     
     # Training

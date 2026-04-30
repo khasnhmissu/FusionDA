@@ -435,7 +435,7 @@ def main():
 
     ap.add_argument('--weights', type=str, default='yolo26s.pt',
                     help='Architecture weights file (for loading model topology).')
-    ap.add_argument('--data', type=str, default='data.yaml')
+    ap.add_argument('--data', type=str, default='configs/data/data.yaml')
     ap.add_argument('--target-images', type=str, required=True)
     ap.add_argument('--target-labels', type=str, required=True)
 

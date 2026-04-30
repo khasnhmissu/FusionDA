@@ -433,7 +433,7 @@ def main():
     ap.add_argument('--checkpoint', nargs='+', required=True)
     ap.add_argument('--names', nargs='+', required=True)
     ap.add_argument('--weights', type=str, default='yolo26s.pt')
-    ap.add_argument('--data', type=str, default='data.yaml')
+    ap.add_argument('--data', type=str, default='configs/data/data.yaml')
     ap.add_argument('--images', type=str, required=True)
     ap.add_argument('--labels', type=str, default=None,
                     help='Optional labels dir — used to prefer TP detections for explanation.')

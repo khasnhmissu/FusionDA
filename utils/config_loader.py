@@ -14,7 +14,7 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    config: str = "data.yaml"
+    config: str = "configs/data/data.yaml"
     workers: int = 8
     batch_size: int = 4
 

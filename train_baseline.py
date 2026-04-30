@@ -7,14 +7,14 @@ No domain adaptation techniques — just standard supervised training on both do
 This serves as a baseline to compare against FDA (train.py).
 
 Usage:
-    # Train on both source + target (default, uses data.yaml)
-    python train_baseline.py --data data.yaml --weights yolo26s.pt --epochs 100 --name baseline_combined
+    # Train on both source + target (default, uses configs/data/data.yaml)
+    python train_baseline.py --data configs/data/data.yaml --weights yolo26s.pt --epochs 100 --name baseline_combined
 
     # Train on source only
-    python train_baseline.py --data data_clear.yaml --weights yolo26s.pt --epochs 100 --name baseline_source_only
+    python train_baseline.py --data configs/data/data_clear.yaml --weights yolo26s.pt --epochs 100 --name baseline_source_only
 
     # Train on target only
-    python train_baseline.py --data data_foggy.yaml --weights yolo26s.pt --epochs 100 --name baseline_target_only
+    python train_baseline.py --data configs/data/data_foggy.yaml --weights yolo26s.pt --epochs 100 --name baseline_target_only
 """
 
 import argparse
@@ -288,7 +288,7 @@ def parse_args():
 
     # Model
     parser.add_argument('--weights', type=str, default='yolo26s.pt', help='Pretrained weights')
-    parser.add_argument('--data', type=str, default='data.yaml', help='Dataset YAML file (supports multi-domain)')
+    parser.add_argument('--data', type=str, default='configs/data/data.yaml', help='Dataset YAML file (supports multi-domain)')
     parser.add_argument('--imgsz', type=int, default=640, help='Image size')
 
     # Training

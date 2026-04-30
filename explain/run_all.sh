@@ -22,7 +22,7 @@ set -o pipefail
 
 # ─── Config ──────────────────────────────────────────────────────
 ARCH_WEIGHTS="yolo26s.pt"
-DATA_YAML="data.yaml"
+DATA_YAML="configs/data/data.yaml"
 
 BASELINE_CKPT="runs/ablation/baseline/weights/baseline.pt"
 PAIRED_RUN_DIR="runs/ablation/paired_full_40ep"
