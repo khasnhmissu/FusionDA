@@ -35,7 +35,7 @@ TARGET_IMGS="datasets/target_real/target_real/val/images"
 TARGET_LBLS="datasets/target_real/target_real/val/labels"
 SOURCE_IMGS="datasets/source_real/source_real/val/images"
 
-IMGSZ=1024
+IMGSZ=640
 DEVICE="${DEVICE:-0}"                 # allow `DEVICE=1 bash explain/run_all.sh`
 N_IMAGES_ATTN=6
 N_IMAGES_DRISE=6

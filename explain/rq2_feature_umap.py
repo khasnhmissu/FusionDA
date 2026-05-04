@@ -201,10 +201,11 @@ def plot_umap_single(source_feat, target_feat, title, save_path,
         ax.scatter(emb[mask, 0], emb[mask, 1], c=color, label=label,
                    alpha=alpha, s=18, edgecolors='none')
     subtitle = f'\nMMD(src↔tgt) = {mmd_val:.4f}' if mmd_val is not None else ''
-    ax.set_title(f'{title}{subtitle}', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10, loc='best')
-    ax.set_xlabel('UMAP dim 1')
-    ax.set_ylabel('UMAP dim 2')
+    ax.set_title(f'{title}{subtitle}', fontsize=18, fontweight='bold')
+    ax.legend(fontsize=14, loc='best')
+    ax.set_xlabel('UMAP dim 1', fontsize=15)
+    ax.set_ylabel('UMAP dim 2', fontsize=15)
+    ax.tick_params(axis='both', labelsize=13)
     ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -226,14 +227,15 @@ def plot_umap_grid(all_embeddings, output_dir):
         ax.scatter(emb[n_src:, 0], emb[n_src:, 1], c='#F18F01', label='Target',
                    alpha=0.55, s=18, edgecolors='none')
         subtitle = f'\nMMD = {mmd:.4f}' if mmd is not None else ''
-        ax.set_title(f'{name}{subtitle}', fontsize=12, fontweight='bold')
-        ax.set_xlabel('UMAP 1')
-        ax.set_ylabel('UMAP 2')
+        ax.set_title(f'{name}{subtitle}', fontsize=17, fontweight='bold')
+        ax.set_xlabel('UMAP 1', fontsize=15)
+        ax.set_ylabel('UMAP 2', fontsize=15)
+        ax.tick_params(axis='both', labelsize=13)
         ax.grid(alpha=0.3)
-        ax.legend(fontsize=9)
+        ax.legend(fontsize=13)
 
     fig.suptitle('Backbone feature space — source vs target',
-                 fontsize=14, fontweight='bold')
+                 fontsize=20, fontweight='bold')
     plt.tight_layout()
     save = output_dir / 'umap_grid.png'
     plt.savefig(save, dpi=150, bbox_inches='tight')
@@ -253,9 +255,11 @@ def plot_tsne(source_feat, target_feat, title, save_path, seed=42):
                c='#2E86AB', label='Source', alpha=0.55, s=18, edgecolors='none')
     ax.scatter(emb[len(source_feat):, 0], emb[len(source_feat):, 1],
                c='#F18F01', label='Target', alpha=0.55, s=18, edgecolors='none')
-    ax.set_title(title, fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.set_xlabel('t-SNE dim 1'); ax.set_ylabel('t-SNE dim 2')
+    ax.set_title(title, fontsize=18, fontweight='bold')
+    ax.legend(fontsize=14)
+    ax.set_xlabel('t-SNE dim 1', fontsize=15)
+    ax.set_ylabel('t-SNE dim 2', fontsize=15)
+    ax.tick_params(axis='both', labelsize=13)
     ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
