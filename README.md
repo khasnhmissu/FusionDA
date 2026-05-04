@@ -14,7 +14,7 @@ Outdoor object detectors trained on clear-weather data degrade severely when dep
 2. **Mean-Teacher knowledge distillation.** A teacher network — built by EMA over the student weights — is fed *source-like* (dehazed target) images and produces high-recall pseudo-labels through the dense `one2many` head. The student then learns from those pseudo-labels on the matching real target images, importing target-side instance knowledge that no labelled set could provide.
 3. **Feature-level alignment.** A consistency loss enforces agreement between the student's features on the (source, target-like) pair, while a Gradient-Reversal-Layer (DANN) discriminator pushes the backbone toward domain-invariant representations on the (source, target) pair.
 
-Trained and evaluated on Cityscapes ⟶ Foggy-Cityscapes (person + car), the resulting teacher reaches **mAP@50 = ... / mAP@50–95 = ...** on the foggy validation split — a +... mAP@50 improvement over a YOLO26-s baseline trained on the source labels alone (see Section 4 of the report for the full ablation).
+Trained and evaluated on Cityscapes ⟶ Foggy-Cityscapes (person + car), the resulting teacher reaches **mAP@50 = 54.03 / mAP@50–95 = 36.31** on the foggy validation split — a +12.23 mAP@50 improvement over a YOLO26-s baseline trained on the source labels alone (see Section 4 of the report for the full ablation).
 
 ---
 
