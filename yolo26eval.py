@@ -11,14 +11,26 @@ from pycocotools.cocoeval import COCOeval
 from PIL import Image as PILImage
 
 
+def _find_images_dir(data_dir: Path):
+    """Locate the images subfolder. Supports two layouts:
+       1. Direct:  data_dir/images  + data_dir/labels   (e.g. real-fog set)
+       2. Nested:  data_dir/.../val/images + .../val/labels
+    """
+    data_path = Path(data_dir)
+    direct = data_path / "images"
+    if direct.is_dir() and (data_path / "labels").is_dir():
+        return direct
+    return next((p for p in data_path.rglob("val/images") if p.is_dir()), None)
+
+
 def create_yaml(data_dir, model_names):
     yaml_path = Path(data_dir) / "eval_data.yaml"
     data_path = Path(data_dir).absolute()
-    val_dir = "val/images"
-    for p in Path(data_dir).rglob("val/images"):
-        if p.is_dir():
-            val_dir = str(p.relative_to(data_dir)).replace("\\", "/")
-            break
+    img_dir = _find_images_dir(data_path)
+    if img_dir is None:
+        val_dir = "val/images"
+    else:
+        val_dir = str(img_dir.relative_to(data_path)).replace("\\", "/")
     dataset_yaml = {
         "path": str(data_path),
         "train": val_dir, "val": val_dir, "test": val_dir,
@@ -120,10 +132,10 @@ def run_coco_size_eval(save_dir: Path, data_dir: Path, model_names: dict):
         return
     print(f"[COCO] Đọc {len(dt_list)} detections từ {dt_path}")
 
-    # Tìm val/images và val/labels
-    img_dir = next((p for p in data_dir.rglob("val/images") if p.is_dir()), None)
+    # Tìm images và labels (hỗ trợ cả layout val/images lẫn images/ trực tiếp)
+    img_dir = _find_images_dir(data_dir)
     if img_dir is None:
-        print("[!] Không tìm thấy val/images — bỏ qua.")
+        print("[!] Không tìm thấy folder images — bỏ qua.")
         return
     label_dir = img_dir.parent / "labels"
 
@@ -297,14 +309,20 @@ if __name__ == "__main__":
     parser.add_argument("--base-weights", default="yolo26s.pt")
     parser.add_argument("--source-dir",   default="source_test")
     parser.add_argument("--target-dir",   default="target_test")
+    parser.add_argument("--real-fog-dir", default=None,
+                        help="Folder real-fog chứa trực tiếp images/ và labels/ (chuẩn YOLO).")
     args = parser.parse_args()
 
     if not os.path.exists(args.weights):
         print(f"[LỖI] Không tìm thấy: '{args.weights}'")
         exit(1)
 
-    for dir_path, name in [(args.source_dir, "Source Test"),
-                           (args.target_dir, "Target Test")]:
+    eval_targets = [(args.source_dir, "Source Test"),
+                    (args.target_dir, "Target Test")]
+    if args.real_fog_dir:
+        eval_targets.append((args.real_fog_dir, "Real Fog Test"))
+
+    for dir_path, name in eval_targets:
         if os.path.exists(dir_path):
             evaluate(args.weights, dir_path, name, args.base_weights)
         else:

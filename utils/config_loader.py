@@ -32,7 +32,6 @@ class TrainingConfig:
 class TeacherConfig:
     """EMA config: θ_teacher = α_eff * θ_teacher + (1-α_eff) * θ_student"""
     alpha: float = 0.999
-    freeze_teacher: bool = False
     update_after_step: int = 2000      # Delay before first EMA update
     alpha_rampup_steps: int = 5000     # Cosine ramp-up for α_eff
 
@@ -56,7 +55,6 @@ class DistillationConfig:
 @dataclass
 class GRLConfig:
     enabled: bool = True
-    use_multiscale: bool = False   # use P3+P4+P5 multi-scale discriminator
     warmup_epochs: int = 20
     max_alpha: float = 1.0         # was 0.3 — too weak, discriminator always won
     weight: float = 0.05           # was 0.02 — overwhelmed by detection loss
@@ -164,7 +162,6 @@ def config_to_namespace(config: FDAConfig) -> Namespace:
     
     # Teacher
     ns.teacher_alpha = config.teacher.alpha
-    ns.freeze_teacher = config.teacher.freeze_teacher
     ns.update_after_step = config.teacher.update_after_step
     ns.alpha_rampup_steps = config.teacher.alpha_rampup_steps
     
@@ -181,7 +178,6 @@ def config_to_namespace(config: FDAConfig) -> Namespace:
     
     # GRL
     ns.use_grl = config.grl.enabled
-    ns.use_multiscale_grl = config.grl.use_multiscale
     ns.grl_warmup = config.grl.warmup_epochs
     ns.grl_max_alpha = config.grl.max_alpha
     ns.grl_weight = config.grl.weight
@@ -222,12 +218,10 @@ def merge_cli_args(config: FDAConfig, args: Namespace) -> FDAConfig:
         'device': ('training', 'device', '--device'),
         'lr0': ('training', 'lr0', '--lr0'),
         'use_grl': ('grl', 'enabled', '--use-grl'),
-        'use_multiscale_grl': ('grl', 'use_multiscale', '--use-multiscale-grl'),
         'name': ('output', 'name', '--name'),
         'project': ('output', 'project', '--project'),
         'enable_monitoring': ('logging', 'enable_monitoring', '--enable-monitoring'),
         'teacher_alpha': ('teacher', 'alpha', '--teacher-alpha'),
-        'freeze_teacher': ('teacher', 'freeze_teacher', '--freeze-teacher'),
     }
     
     for arg_name, (section, attr, cli_flag) in cli_mapping.items():
@@ -244,15 +238,12 @@ def merge_cli_args(config: FDAConfig, args: Namespace) -> FDAConfig:
 
 def print_config(config: FDAConfig):
     """Print configuration summary."""
-    grl_mode = 'Disabled'
-    if config.grl.enabled:
-        grl_mode = 'Multi-Scale (P3+P4+P5)' if config.grl.use_multiscale else 'Single-Scale'
     print("=" * 60)
     print(f"Model:     {config.model.weights}")
     print(f"Data:      {config.data.config}")
     print(f"Epochs:    {config.training.epochs}")
     print(f"Batch:     {config.data.batch_size}")
     print(f"Device:    {config.training.device}")
-    print(f"GRL:       {grl_mode}")
+    print(f"GRL:       {'Enabled' if config.grl.enabled else 'Disabled'}")
     print(f"Warmup:    {config.training.warmup_epochs} epochs")
     print("=" * 60)

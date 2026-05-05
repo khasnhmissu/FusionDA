@@ -21,15 +21,14 @@ Feature hooks (on student backbone):
     → saved immediately as feat_sr, feat_sf, feat_tr
 
 Feature hooks (on teacher backbone):
-  - teacher_backbone_hook: captures features from teacher(target_fake)
-    → saved as feat_teacher_tf  [no_grad, detached]
+  - teacher_backbone_hook: drained after teacher(target_fake) to keep the hook
+    state clean for subsequent forwards.
 
 Losses:
   loss_source      = detection(pred_source, GT)
   loss_source_fake = detection(pred_source_fake, GT)
   loss_consistency = cosine_distance(feat_sf, feat_sr.detach())
   loss_distillation = detection(pred_target_real, pseudo_labels_from_teacher)
-  loss_feature_kd  = cosine_distance(feat_tr, feat_teacher_tf.detach())
   loss_domain      = GRL(discriminator(feat_sr), discriminator(feat_tr))
 
 Gradient flow:
@@ -37,20 +36,13 @@ Gradient flow:
   loss_source_fake → student backbone (normal)
   loss_consistency → student backbone via source_fake path only (sr detached)
   loss_distillation→ student backbone (normal, pseudo-labels are detached targets)
-  loss_feature_kd  → student backbone via target_real path only (teacher detached)
   loss_domain      → student backbone REVERSED via GRL (adversarial)
                    → discriminator NORMAL (learns to classify domains)
 
 No double-gradient: each feature tensor feeds into at most ONE loss with gradient.
   feat_sr:  → GRL (with reversed gradient) + detached in consistency
   feat_sf:  → consistency (gradient flows normally)
-  feat_tr:  → GRL (with reversed gradient) + feature_kd (gradient flows normally)
-  
-Note on feat_tr dual use: GRL reverses gradient to make features domain-invariant,
-while feature_kd pulls student features toward teacher. Both operate on the same
-tensor but PyTorch autograd handles multiple consumers correctly — gradients are
-summed, not conflicted, because both objectives want the student to produce
-target features that are (a) domain-invariant and (b) similar to teacher's view.
+  feat_tr:  → GRL (with reversed gradient)
 """
 import argparse
 import gc
@@ -72,7 +64,6 @@ from ultralytics.utils.nms import non_max_suppression
 
 from domain_adaptation import (
     DomainDiscriminator, YOLOv8FeatureHook, find_last_backbone_layer,
-    MultiScaleFusedDiscriminator, MultiScaleFeatureHook, find_multiscale_layers,
     compute_domain_loss,
     get_grl_alpha, get_domain_accuracy,
 )
@@ -228,7 +219,6 @@ def train(opt):
     teacher_ema = WeightEMA(
         model_student,
         alpha=opt.teacher_alpha,
-        freeze_teacher=getattr(opt, 'freeze_teacher', False),
         device=device,
         update_after_step=getattr(opt, 'update_after_step', 500),
         alpha_rampup_steps=getattr(opt, 'alpha_rampup_steps', 2000),
@@ -255,61 +245,26 @@ def train(opt):
     LOGGER.info(f'{colorstr("Hooks:")} Teacher backbone hook at layer {teacher_backbone_idx}')
     
     # ── GRL / Domain-Adaptation setup ────────────────────────────────────
-    domain_discriminator = None   # single-scale  DomainDiscriminator
-    ms_discriminator    = None    # multi-scale   MultiScaleFusedDiscriminator
-    ms_feature_hook     = None    # multi-scale   MultiScaleFeatureHook (ONLY for GRL)
-    grl_optimizer       = None
-    use_multiscale_grl  = getattr(opt, 'use_multiscale_grl', False)
+    domain_discriminator = None
+    grl_optimizer        = None
 
     if opt.use_grl:
         with torch.no_grad():
             test_img = torch.zeros(1, 3, opt.imgsz, opt.imgsz, device=device)
+            _ = model_student(test_img)
+            test_feat = student_backbone_hook.get_features()
+            in_channels = test_feat.shape[1] if test_feat is not None else 256
 
-        if use_multiscale_grl:
-            # ── Multi-scale discriminator  (P3 / P4 / P5) ──────────────────
-            ms_layer_indices = find_multiscale_layers(model_student)
-            LOGGER.info(f'{colorstr("GRL [multi-scale]:")} hooks at layers {ms_layer_indices}')
-
-            ms_feature_hook = MultiScaleFeatureHook(model_student, ms_layer_indices)
-
-            # Probe channel sizes
-            with torch.no_grad():
-                _ = model_student(test_img)
-                # Drain the single-scale hook too (avoid stale features)
-                _ = student_backbone_hook.get_features()
-                probe_feats = ms_feature_hook.get_features()
-                in_ch_list = [
-                    f.shape[1] if f is not None else 256
-                    for f in probe_feats
-                ]
-            LOGGER.info(f'{colorstr("GRL [multi-scale]:")} in_channels per scale = {in_ch_list}')
-
-            ms_discriminator = MultiScaleFusedDiscriminator(
-                in_channels_list=in_ch_list,
-                hidden_dim=opt.grl_hidden_dim,
-                dropout=getattr(opt, 'grl_dropout', 0.3),
-            ).to(device)
-            grl_optimizer = optim.Adam(
-                ms_discriminator.parameters(),
-                lr=getattr(opt, 'grl_lr', 1e-4),
-            )
-        else:
-            # ── Single-scale discriminator  (backbone end) ─────────────────
-            with torch.no_grad():
-                _ = model_student(test_img)
-                test_feat = student_backbone_hook.get_features()
-                in_channels = test_feat.shape[1] if test_feat is not None else 256
-
-            domain_discriminator = DomainDiscriminator(
-                in_channels=in_channels,
-                hidden_dim=opt.grl_hidden_dim,
-                dropout=getattr(opt, 'grl_dropout', 0.3),
-            ).to(device)
-            grl_optimizer = optim.Adam(
-                domain_discriminator.parameters(),
-                lr=getattr(opt, 'grl_lr', 1e-4),
-            )
-            LOGGER.info(f'{colorstr("GRL [single-scale]:")} in_channels={in_channels}')
+        domain_discriminator = DomainDiscriminator(
+            in_channels=in_channels,
+            hidden_dim=opt.grl_hidden_dim,
+            dropout=getattr(opt, 'grl_dropout', 0.3),
+        ).to(device)
+        grl_optimizer = optim.Adam(
+            domain_discriminator.parameters(),
+            lr=getattr(opt, 'grl_lr', 1e-4),
+        )
+        LOGGER.info(f'{colorstr("GRL:")} in_channels={in_channels}')
     
     # Checkpoint epochs for pseudo-label quality analysis
     checkpoint_epochs = set(getattr(opt, 'checkpoint_epochs', [10, 20, 30]))
@@ -366,9 +321,6 @@ def train(opt):
         hyp=default_cfg,
         data=data_dict,
         stride=gs,
-        copy_paste_small=getattr(opt, 'use_copy_paste_small', False),
-        copy_paste_max_copies=getattr(opt, 'copy_paste_max_copies', 3),
-        copy_paste_small_thr=getattr(opt, 'copy_paste_small_thr', 32.0),
     )
     
     paired_loader = DataLoader(
@@ -391,9 +343,6 @@ def train(opt):
         class_mapping         = class_mapping,
         box_gain              = getattr(opt, 'box_gain', 7.5),
         cls_gain              = getattr(opt, 'cls_gain', 0.5),
-        use_small_object_loss = getattr(opt, 'use_small_object_loss', False),
-        inner_ratio           = getattr(opt, 'inner_ratio', 0.7),
-        use_wise_iou          = getattr(opt, 'use_wise_iou', False),
     )
     
     # AMP
@@ -450,10 +399,9 @@ def train(opt):
         LOGGER.info('  All DA disabled: no teacher, no GRL, no consistency, no distillation')
         LOGGER.info('  Validation: source_real + target_real (dual-domain mAP)')
     else:
-        LOGGER.info(colorstr('Pipeline: ') + 'loss = L_src + L_src_fake + λ·L_distill + λ_feat·L_feat_kd + β·L_consistency + L_domain')
+        LOGGER.info(colorstr('Pipeline: ') + 'loss = L_src + L_src_fake + λ·L_distill + β·L_consistency + L_domain')
         LOGGER.info(f'  L_src / L_src_fake:  Detection loss on source_real/fake with GT labels')
         LOGGER.info(f'  L_distill:           Pseudo-label detection loss (teacher→student)')
-        LOGGER.info(f'  L_feat_kd:           Feature KD: student(target_real) ↔ teacher(target_fake)')
         LOGGER.info(f'  L_consistency:       Feature consistency: student(source_real) ↔ student(source_fake)')
         LOGGER.info(f'  L_domain:            GRL domain adversarial loss (source_real ↔ target_real)')
         LOGGER.info(colorstr('BN Protection: ') + 'BatchNorm frozen during source_fake + target_real forwards (only source_real updates BN stats)')
@@ -515,9 +463,7 @@ def train(opt):
         model_teacher.eval()
         
         if opt.use_grl:
-            if use_multiscale_grl and ms_discriminator is not None:
-                ms_discriminator.train()
-            elif domain_discriminator is not None:
+            if domain_discriminator is not None:
                 domain_discriminator.train()
             current_grl_alpha = get_grl_alpha(epoch, opt.epochs, opt.grl_warmup, opt.grl_max_alpha)
         
@@ -557,10 +503,6 @@ def train(opt):
             imgs_source_fake = imgs_source_fake.clamp(0, 1)
             imgs_target = imgs_target.clamp(0, 1)
             imgs_target_fake = imgs_target_fake.clamp(0, 1)
-            
-            # Init multi-scale feature placeholders
-            ms_src_feats = [None] * (len(ms_feature_hook.hooks) if ms_feature_hook else 0)
-            ms_tgt_feats = [None] * (len(ms_feature_hook.hooks) if ms_feature_hook else 0)
 
             # ══════════════════════════════════════════════════════════
             # BASELINE MODE: Pure detection — only source_real + GT
@@ -604,8 +546,6 @@ def train(opt):
                 
                 # Capture student backbone features IMMEDIATELY
                 feat_sr = student_backbone_hook.get_features()  # [B, C, H, W]
-                if use_multiscale_grl and ms_feature_hook:
-                    ms_src_feats = ms_feature_hook.get_features()
 
                 # ══════════════════════════════════════════════════════════
                 # FORWARD PASS #2: student(source_fake)
@@ -627,9 +567,6 @@ def train(opt):
                     
                     # Capture features IMMEDIATELY (hook is overwritten each forward)
                     feat_sf = student_backbone_hook.get_features()  # [B, C, H, W]
-                    # Note: multi-scale hooks NOT needed for source_fake (GRL only uses src + tgt)
-                    if use_multiscale_grl and ms_feature_hook:
-                        _ = ms_feature_hook.get_features()  # drain to avoid stale data
                 else:
                     loss_source_fake = torch.tensor(0.0, device=device, requires_grad=False)
                     feat_sf = None
@@ -649,11 +586,9 @@ def train(opt):
                 if need_target_forward:
                     # BN already frozen globally (see epoch init above)
                     pred_target = model_student(imgs_target)
-                    
+
                     # Capture features IMMEDIATELY
                     feat_tr = student_backbone_hook.get_features()  # [B, C, H, W]
-                    if use_multiscale_grl and ms_feature_hook:
-                        ms_tgt_feats = ms_feature_hook.get_features()
                 else:
                     pred_target = None
                     feat_tr = None
@@ -672,8 +607,7 @@ def train(opt):
                     pseudo_labels = [torch.zeros(0, 6, device=device)
                                      for _ in range(imgs_target.shape[0])]
                     n_pseudo = 0
-                    feat_teacher_tf = None  # No feature KD during burn-in
-                    
+
                     if i == 0 and epoch == 0:
                         LOGGER.info(f'[BURN-IN] No pseudo labels for first {burn_in_epochs} epochs')
                 else:
@@ -776,11 +710,10 @@ def train(opt):
                     # partners, flip, scale, crop are IDENTICAL between
                     # target_real and target_fake now, so pseudo-label box
                     # coords land on the exact same pixels in student's
-                    # target_real forward). Feature KD also uses this
-                    # forward's features.
+                    # target_real forward).
                     with torch.no_grad():
                         pred_teacher = model_teacher(imgs_target_fake)
-                        feat_teacher_tf = teacher_backbone_hook.get_features()
+                        _ = teacher_backbone_hook.get_features()  # drain hook
                         
                         # ════════════════════════════════════════════════════
                         # PSEUDO-LABEL GENERATION — Use ONE2MANY head + NMS
@@ -996,28 +929,7 @@ def train(opt):
                 else:
                     loss_distillation = torch.tensor(0.0, device=device, requires_grad=False)
                 
-                # ── Loss 2: Feature KD ────────────────────────────────────
-                # Student(target_real) features ↔ Teacher(target_fake) features
-                # Teacher side detached — gradient only flows to student
-                loss_feature_kd = torch.tensor(0.0, device=device, requires_grad=False)
-                lambda_feature = getattr(opt, 'lambda_feature', 0.05)
-                
-                if (getattr(opt, 'use_feature_distill', False)
-                        and feat_teacher_tf is not None
-                        and feat_tr is not None
-                        and epoch >= burn_in_epochs):
-                    tf = feat_teacher_tf.detach()  # Teacher features — NO gradient
-                    sf = feat_tr                    # Student features — gradient flows here
-                    
-                    if sf.shape != tf.shape:
-                        tf = torch.nn.functional.interpolate(
-                            tf, size=sf.shape[2:], mode='bilinear', align_corners=False
-                        )
-                    # Cosine loss: scale-invariant, values in [0, 2]
-                    cos_sim = torch.nn.functional.cosine_similarity(sf, tf, dim=1)
-                    loss_feature_kd = 1.0 - cos_sim.mean()
-                
-                # ── Loss 3: Consistency ───────────────────────────────────
+                # ── Loss 2: Consistency ───────────────────────────────────
                 # student(source_real) features ↔ student(source_fake) features
                 # Source_real is anchor (detached) — gradient only to source_fake path
                 loss_consistency = torch.tensor(0.0, device=device, requires_grad=False)
@@ -1035,7 +947,7 @@ def train(opt):
                         cos_sim = torch.nn.functional.cosine_similarity(sf_learn, sr_anchor, dim=1)
                         loss_consistency = 1.0 - cos_sim.mean()
                 
-                # ── Loss 4: Domain adversarial (GRL) ──────────────────────
+                # ── Loss 3: Domain adversarial (GRL) ──────────────────────
                 # Features: source_real vs target_real → discriminator
                 # GRL reverses gradient → backbone learns domain-invariant features
                 loss_domain = torch.tensor(0.0, device=device, requires_grad=False)
@@ -1047,33 +959,18 @@ def train(opt):
                         boost = 1.0 + 2.0 * (prev_domain_acc - 0.75) / 0.25
                         effective_grl_weight = min(opt.grl_weight * boost, opt.grl_weight * 3.0)
 
-                    if use_multiscale_grl and ms_discriminator is not None:
-                        if ms_feature_hook.all_available(ms_src_feats) and \
-                           ms_feature_hook.all_available(ms_tgt_feats):
-                            ms_discriminator.set_alpha(current_grl_alpha)
-                            fused_src_logit = ms_discriminator(ms_src_feats, current_grl_alpha)
-                            fused_tgt_logit = ms_discriminator(ms_tgt_feats, current_grl_alpha)
-                            loss_domain = compute_domain_loss(
-                                fused_src_logit, fused_tgt_logit
-                            ) * effective_grl_weight
-                            domain_acc = get_domain_accuracy(fused_src_logit, fused_tgt_logit)
-                            if domain_monitor:
-                                domain_monitor.update_domain_accuracy(
-                                    fused_src_logit, fused_tgt_logit, epoch, i
-                                )
-                    else:
-                        # Single-scale: source_real vs target_real features
-                        if feat_sr is not None and feat_tr is not None:
-                            domain_pred_source = domain_discriminator(feat_sr, current_grl_alpha)
-                            domain_pred_target = domain_discriminator(feat_tr, current_grl_alpha)
-                            loss_domain = compute_domain_loss(
-                                domain_pred_source, domain_pred_target
-                            ) * effective_grl_weight
-                            domain_acc = get_domain_accuracy(domain_pred_source, domain_pred_target)
-                            if domain_monitor:
-                                domain_monitor.update_domain_accuracy(
-                                    domain_pred_source, domain_pred_target, epoch, i
-                                )
+                    # source_real vs target_real features
+                    if feat_sr is not None and feat_tr is not None:
+                        domain_pred_source = domain_discriminator(feat_sr, current_grl_alpha)
+                        domain_pred_target = domain_discriminator(feat_tr, current_grl_alpha)
+                        loss_domain = compute_domain_loss(
+                            domain_pred_source, domain_pred_target
+                        ) * effective_grl_weight
+                        domain_acc = get_domain_accuracy(domain_pred_source, domain_pred_target)
+                        if domain_monitor:
+                            domain_monitor.update_domain_accuracy(
+                                domain_pred_source, domain_pred_target, epoch, i
+                            )
                 
                 loss_domain = ensure_scalar(loss_domain)
                 
@@ -1082,7 +979,6 @@ def train(opt):
                 #   loss_source:      ∂/∂θ via forward #1 (normal)
                 #   loss_source_fake: ∂/∂θ via forward #2 (normal)
                 #   loss_distillation:∂/∂θ via forward #3 (normal, pseudo-labels are fixed targets)
-                #   loss_feature_kd:  ∂/∂θ via feat_tr from forward #3 (teacher side detached)
                 #   loss_consistency: ∂/∂θ via feat_sf from forward #2 (source_real side detached)
                 #   loss_domain:      ∂/∂θ via feat_sr, feat_tr through GRL (reversed)
                 # source_fake uses CycleGAN images with GT labels — training at full
@@ -1097,7 +993,6 @@ def train(opt):
                 loss = (loss_source
                         + loss_source_fake * sf_weight
                         + loss_distillation * current_lambda
-                        + loss_feature_kd   * lambda_feature
                         + loss_consistency  * consistency_weight
                         + loss_domain)
                 loss = torch.clamp(loss, 0, 500)
@@ -1120,11 +1015,8 @@ def train(opt):
 
             grad_clip = getattr(opt, 'gradient_clip', 2.0)
             torch.nn.utils.clip_grad_norm_(model_student.parameters(), max_norm=grad_clip)
-            if opt.use_grl:
-                if use_multiscale_grl and ms_discriminator is not None:
-                    torch.nn.utils.clip_grad_norm_(ms_discriminator.parameters(), max_norm=grad_clip)
-                elif domain_discriminator is not None:
-                    torch.nn.utils.clip_grad_norm_(domain_discriminator.parameters(), max_norm=grad_clip)
+            if opt.use_grl and domain_discriminator is not None:
+                torch.nn.utils.clip_grad_norm_(domain_discriminator.parameters(), max_norm=grad_clip)
 
             # Check for NaN gradients
             grad_nan = False
@@ -1179,7 +1071,6 @@ def train(opt):
                 'loss_source':       loss_source.item(),
                 'loss_source_fake':  loss_source_fake.item(),
                 'loss_distill':      loss_distillation.item(),
-                'loss_feature_kd':   loss_feature_kd.item(),
                 'loss_consistency':  loss_consistency.item(),
                 'loss_domain':       loss_domain.item(),
                 'loss_total':        loss.item(),
@@ -1223,7 +1114,6 @@ def train(opt):
                 'mem':     mem,
                 'box':     f'{mloss[0]:.4f}',
                 'distill': f'{mloss[3]:.4f}',
-                'feat_kd': f'{loss_feature_kd.item():.4f}',
                 'cons':    f'{loss_consistency.item():.4f}',
                 'domain':  f'{mloss[4]:.4f}',
             })
@@ -1386,9 +1276,7 @@ def train(opt):
     # ══════════════════════════════════════════════════════════════════════
     student_backbone_hook.remove()
     teacher_backbone_hook.remove()
-    if ms_feature_hook:
-        ms_feature_hook.remove()
-    
+
     logger.finalize()
     if domain_monitor:
         domain_monitor.finalize()
@@ -1410,7 +1298,7 @@ def parse_args():
     parser.add_argument('--cfg', type=str, default=None, help='custom model.yaml file (e.g. yolov8-p2.yaml)')
     parser.add_argument('--weights', type=str, default='yolo26s.pt')
     parser.add_argument('--data', type=str, default='configs/data/data.yaml')
-    parser.add_argument('--imgsz', type=int, default=1024)
+    parser.add_argument('--imgsz', type=int, default=640)
     
     # Training
     parser.add_argument('--epochs', type=int, default=100)
@@ -1426,8 +1314,7 @@ def parse_args():
     parser.add_argument('--conf-thres-max', type=float, default=0.7)
     parser.add_argument('--iou-thres', type=float, default=0.45)
     parser.add_argument('--lambda-weight', type=float, default=0.2)
-    parser.add_argument('--freeze-teacher', action='store_true', default=None)
-    
+
     # Progressive
     parser.add_argument('--use-progressive-lambda', action='store_true')
     parser.add_argument('--warmup-epochs', type=int, default=10)
@@ -1435,9 +1322,6 @@ def parse_args():
     
     # GRL
     parser.add_argument('--use-grl', action='store_true')
-    parser.add_argument('--use-multiscale-grl', action='store_true',
-                        help='Use multi-scale domain discriminator (P3+P4+P5). '
-                             'More SOTA but ~15%% more compute. Requires --use-grl.')
     parser.add_argument('--grl-warmup', type=int, default=5,
                         help='Epochs before GRL + consistency activate. '
                              'Also controls consistency start epoch when --use-grl is set.')
@@ -1463,16 +1347,6 @@ def parse_args():
                              'Validates on both source and target to verify detection loss.')
     parser.add_argument('--eval-source', action='store_true',
                         help='Also evaluate on source_real val split (dual-domain mAP)')
-    
-    # ── Feature KD (Knowledge Distillation) ──────────────────────────────
-    parser.add_argument(
-        '--use-feature-distill', action='store_true',
-        help='Enable Feature KD: student(target_real) features ↔ teacher(target_fake) features'
-    )
-    parser.add_argument(
-        '--lambda-feature', type=float, default=0.05,
-        help='Weight for Feature KD loss (default 0.05).'
-    )
 
     # ── Consistency ──────────────────────────────────────────────────────
     parser.add_argument(
@@ -1491,19 +1365,7 @@ def parse_args():
              'overfitting to CycleGAN artifacts. Set to 0 to disable source_fake training.'
     )
 
-    # ── Small-object loss improvements ──────────────────────────────────
-    parser.add_argument(
-        '--use-small-object-loss', action='store_true',
-        help='Replace CIoU with Inner-CIoU + ScaleAware TAL for better small-object mAP'
-    )
-    parser.add_argument(
-        '--inner-ratio', type=float, default=0.7,
-        help='Auxiliary box scale for Inner-CIoU (0 < r <= 1, default 0.7)'
-    )
-    parser.add_argument(
-        '--use-wise-iou', action='store_true',
-        help='Enable WiseIoU v3 reweighting on top of Inner-CIoU'
-    )
+    # ── Detection loss gains ────────────────────────────────────────────
     parser.add_argument(
         '--box-gain', type=float, default=7.5,
         help='Box/IoU loss weight (default 7.5)'
@@ -1511,26 +1373,6 @@ def parse_args():
     parser.add_argument(
         '--cls-gain', type=float, default=0.5,
         help='Classification loss weight (default 0.5)'
-    )
-
-    # ── Small-object Copy-Paste augmentation ─────────────────────────────
-    parser.add_argument(
-        '--use-copy-paste-small', action='store_true',
-        help='Enable Kisantal-2019 small-object copy-paste augmentation on '
-             'the source pair (both source_real AND source_fake, with a '
-             'shared seed so every paste lands at the same position on both '
-             'sides — pair-pixel alignment is preserved, consistency loss '
-             'stays on). Adds fog-safe color-match + Gaussian α-blend on top '
-             'of Kisantal. See utils/copy_paste_small.py for details. '
-             'Expected: +3-7 pts AP_small with no trade-off on other losses.'
-    )
-    parser.add_argument(
-        '--copy-paste-max-copies', type=int, default=3,
-        help='Max number of copies per small object (default 3)'
-    )
-    parser.add_argument(
-        '--copy-paste-small-thr', type=float, default=32.0,
-        help='Max side length (pixels) to consider object small (default 32)'
     )
 
     return parser.parse_args()
@@ -1557,13 +1399,8 @@ if __name__ == '__main__':
     print(f"Batch:   {args.batch}")
     print(f"Device:  cuda:{args.device}")
     if not getattr(args, 'baseline', False):
-        grl_mode = 'Disabled'
-        if args.use_grl:
-            grl_mode = 'Multi-Scale (P3+P4+P5)' if getattr(args, 'use_multiscale_grl', False) else 'Single-Scale'
-        print(f"GRL:     {grl_mode}")
-        freeze_teacher = getattr(args, 'freeze_teacher', False)
-        print(f"Teacher: {'FROZEN' if freeze_teacher else 'EMA'}")
-        print(f"Feature KD: {'ON' if getattr(args, 'use_feature_distill', False) else 'OFF'}")
+        print(f"GRL:     {'Enabled' if args.use_grl else 'Disabled'}")
+        print(f"Teacher: EMA")
     else:
         print("Mode:    Source-only detection (no teacher, GRL, consistency)")
         print("Val:     Source mAP + Target mAP (dual-domain)")
