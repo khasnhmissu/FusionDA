@@ -61,16 +61,7 @@ class DomainMonitor:
         mmd_every_n_epochs: int = 1,
         verbose: bool = True,
     ):
-        """
-        Initialize domain monitor.
-        
-        Args:
-            save_dir: Base directory for saving outputs
-            umap_epochs: Epochs to generate UMAP (e.g., [0, 50, 100, 199])
-            tsne_epochs: Epochs to generate t-SNE (e.g., [0, 100, 199])
-            mmd_every_n_epochs: Compute MMD every N epochs
-            verbose: Print status messages
-        """
+        """Initialize domain monitor."""
         self.save_dir = Path(save_dir)
         self.explainability_dir = self.save_dir / 'explainability'
         self.explainability_dir.mkdir(parents=True, exist_ok=True)
@@ -117,17 +108,7 @@ class DomainMonitor:
         epoch: int = None,
         iteration: int = None,
     ):
-        """
-        Update domain accuracy tracker with batch predictions.
-        
-        Call this every iteration when GRL is active.
-        
-        Args:
-            domain_pred_source: [B, 1] logits for source domain
-            domain_pred_target: [B, 1] logits for target domain
-            epoch: Current epoch (for logging)
-            iteration: Current iteration (for logging)
-        """
+        """Update domain accuracy tracker. Call every iteration when GRL is active."""
         if domain_pred_source is None or domain_pred_target is None:
             return
         
@@ -146,17 +127,7 @@ class DomainMonitor:
         labels_tr: torch.Tensor = None,
         max_batches: int = 10,  # Limit to prevent OOM
     ):
-        """
-        Collect features for end-of-epoch analysis.
-        
-        Call this for a few batches per epoch to accumulate features.
-        
-        Args:
-            features_*: Feature tensors [B, C, H, W] or [B, D]
-            labels_*: Class labels [B]
-            max_batches: Maximum number of batches to keep (older ones are dropped)
-        """
-        # Check if we've reached the limit - if so, skip collection
+        """Collect features for end-of-epoch UMAP/MMD analysis (call for a few batches per epoch)."""
         if len(self._epoch_features.get('sr', [])) >= max_batches:
             return
         
@@ -191,23 +162,12 @@ class DomainMonitor:
         return result
     
     def end_epoch(self, epoch: int):
-        """
-        End of epoch processing.
-        
-        - Computes MMD
-        - Generates UMAP/t-SNE if scheduled
-        - Saves domain accuracy
-        
-        Args:
-            epoch: Current epoch number
-        """
+        """End of epoch: compute MMD, generate UMAP/t-SNE if scheduled, save domain accuracy."""
         self.current_epoch = epoch
-        
-        # Get collected features
+
         features = self._get_collected_features()
         labels = self._get_collected_labels()
-        
-        # 1. Compute MMD
+
         if features and epoch % self.mmd_every_n_epochs == 0:
             self.mmd_tracker.update(
                 epoch,
@@ -221,12 +181,10 @@ class DomainMonitor:
             if self.verbose:
                 print(f"[MMD] {self.mmd_tracker.get_interpretation()}")
         
-        # 2. Domain accuracy
         domain_result = self.domain_acc_tracker.end_epoch(epoch)
         if self.verbose:
             print(f"[DomainAcc] {self.domain_acc_tracker.get_interpretation()}")
-        
-        # 3. UMAP visualization
+
         if epoch in self.umap_epochs and features:
             if self.verbose:
                 print(f"[UMAP] Generating epoch {epoch} visualization...")
@@ -240,7 +198,6 @@ class DomainMonitor:
                 epoch=epoch,
             )
         
-        # 4. t-SNE visualization
         if epoch in self.tsne_epochs and features:
             if self.verbose:
                 print(f"[t-SNE] Generating epoch {epoch} visualization...")
@@ -254,7 +211,6 @@ class DomainMonitor:
                 epoch=epoch,
             )
         
-        # Clear collected features
         self._epoch_features.clear()
         self._epoch_labels.clear()
         
@@ -264,12 +220,7 @@ class DomainMonitor:
         }
     
     def get_status_string(self) -> str:
-        """
-        Get current status as formatted string.
-        
-        Returns:
-            str: Multi-line status summary
-        """
+        """Get current status as formatted multi-line string."""
         lines = [
             f"=== Domain Adaptation Status (Epoch {self.current_epoch}) ===",
             self.mmd_tracker.get_interpretation(),
@@ -294,7 +245,6 @@ class DomainMonitor:
         
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         
-        # Plot 1: MMD(SR, TR) over time
         ax1 = axes[0, 0]
         if self.mmd_tracker.history:
             epochs = [h['epoch'] for h in self.mmd_tracker.history]
@@ -308,7 +258,6 @@ class DomainMonitor:
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # Plot 2: All MMD values
         ax2 = axes[0, 1]
         if self.mmd_tracker.history:
             epochs = [h['epoch'] for h in self.mmd_tracker.history]
@@ -328,7 +277,6 @@ class DomainMonitor:
         ax2.legend(fontsize=8)
         ax2.grid(True, alpha=0.3)
         
-        # Plot 3: Domain accuracy
         ax3 = axes[1, 0]
         if self.domain_acc_tracker.history:
             epochs = [h['epoch'] for h in self.domain_acc_tracker.history]
@@ -342,13 +290,11 @@ class DomainMonitor:
         ax3.legend()
         ax3.grid(True, alpha=0.3)
         
-        # Plot 4: Status text
         ax4 = axes[1, 1]
         ax4.axis('off')
-        
+
         status_text = self.get_status_string()
-        
-        # Add interpretation guide
+
         guide = """
 Decision Guide:
 ✅ Good: MMD(SR,TR) < 0.15 AND DomainAcc ~ 50%
@@ -375,19 +321,12 @@ Expected Timeline:
         print(f"[DomainMonitor] Dashboard saved: {save_path}")
     
     def finalize(self):
-        """
-        Finalize monitoring - save all data and generate summary.
-        
-        Call this at the end of training.
-        """
-        # Save CSV files
+        """Save all data and generate the summary dashboard. Call at end of training."""
         self.mmd_tracker.save(self.explainability_dir / 'mmd_history.csv')
         self.domain_acc_tracker.save(self.explainability_dir / 'domain_accuracy.csv')
-        
-        # Generate dashboard
+
         self.generate_summary_dashboard()
-        
-        # Save summary JSON
+
         summary = {
             'total_epochs': self.current_epoch + 1,
             'final_mmd': self.mmd_tracker.get_latest(),
@@ -410,17 +349,7 @@ Expected Timeline:
 
 
 def create_monitor_from_args(opt, save_dir: str) -> DomainMonitor:
-    """
-    Create DomainMonitor from training arguments.
-    
-    Args:
-        opt: Training arguments namespace
-        save_dir: Save directory
-    
-    Returns:
-        DomainMonitor instance
-    """
-    # Determine UMAP epochs based on total epochs
+    """Create DomainMonitor from training arguments."""
     total_epochs = getattr(opt, 'epochs', 200)
     
     if total_epochs <= 50:

@@ -139,7 +139,6 @@ class PairedAugDataset(Dataset):
         return len(self.real_ds)
 
     def __getitem__(self, idx):
-        # 1. Draw a single seed for this __getitem__ invocation.
         seed = random.randint(0, 2**31 - 1)
 
         # 2. Snapshot worker RNG state so seeding does not derail the

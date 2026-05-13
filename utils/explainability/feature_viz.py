@@ -43,7 +43,6 @@ except ImportError:
     print("[Warning] umap-learn not installed. Run: pip install umap-learn")
 
 
-# Color schemes
 DOMAIN_COLORS = {
     'SR': '#2E86AB',   # Blue - Source Real
     'SF': '#7EBDC2',   # Light Blue - Source Fake
@@ -95,12 +94,7 @@ class FeatureVisualizer:
     """
     
     def __init__(self, save_dir: str = 'explainability'):
-        """
-        Initialize visualizer.
-        
-        Args:
-            save_dir: Directory to save plots
-        """
+        """Initialize visualizer."""
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         
@@ -168,15 +162,8 @@ class FeatureVisualizer:
         epoch: int = 0,
         title: str = None,
     ):
-        """
-        Generate UMAP visualization.
-        
-        Args:
-            features_*: Feature tensors for each domain
-            labels_*: Class labels (optional)
-            epoch: Current epoch (for filename)
-            title: Custom title
-        
+        """Generate UMAP visualization.
+
         Returns:
             save_path: Path to saved figure
         """
@@ -211,10 +198,8 @@ class FeatureVisualizer:
             print(f"[UMAP] Error: {e}")
             return None
         
-        # Create figure with 2 subplots
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        
-        # Plot 1: Domain coloring
+
         for domain in np.unique(domains):
             mask = domains == domain
             ax1.scatter(
@@ -231,8 +216,7 @@ class FeatureVisualizer:
         ax1.set_xlabel('UMAP-1')
         ax1.set_ylabel('UMAP-2')
         ax1.grid(True, alpha=0.3)
-        
-        # Plot 2: Class coloring (if available)
+
         unique_classes = np.unique(classes[classes >= 0])
         if len(unique_classes) > 0:
             for i, cls in enumerate(unique_classes):
@@ -255,14 +239,12 @@ class FeatureVisualizer:
         ax2.set_xlabel('UMAP-1')
         ax2.set_ylabel('UMAP-2')
         ax2.grid(True, alpha=0.3)
-        
-        # Title
+
         epoch_title = title or f'UMAP Feature Space - Epoch {epoch}'
         fig.suptitle(epoch_title, fontsize=14, fontweight='bold')
-        
+
         plt.tight_layout()
-        
-        # Save
+
         save_path = self.save_dir / f'umap_epoch_{epoch:03d}.png'
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
@@ -281,15 +263,8 @@ class FeatureVisualizer:
         epoch: int = 0,
         perplexity: int = 30,
     ):
-        """
-        Generate t-SNE visualization (for validation).
-        
-        Args:
-            features_*: Feature tensors
-            labels_*: Class labels (optional)
-            epoch: Current epoch
-            perplexity: t-SNE perplexity parameter
-        
+        """Generate t-SNE visualization (for validation).
+
         Returns:
             save_path: Path to saved figure
         """
@@ -332,10 +307,8 @@ class FeatureVisualizer:
             print(f"[t-SNE] Error: {e}")
             return None
         
-        # Create figure
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        
-        # Plot 1: Domain coloring
+
         for domain in np.unique(domains):
             mask = domains == domain
             ax1.scatter(
@@ -346,14 +319,13 @@ class FeatureVisualizer:
                 alpha=0.6,
                 s=25,
             )
-        
+
         ax1.set_title('Domain Distribution')
         ax1.legend(loc='upper right')
         ax1.set_xlabel('t-SNE-1')
         ax1.set_ylabel('t-SNE-2')
         ax1.grid(True, alpha=0.3)
-        
-        # Plot 2: Class coloring
+
         unique_classes = np.unique(classes[classes >= 0])
         if len(unique_classes) > 0:
             for i, cls in enumerate(unique_classes):
@@ -375,11 +347,10 @@ class FeatureVisualizer:
         ax2.set_xlabel('t-SNE-1')
         ax2.set_ylabel('t-SNE-2')
         ax2.grid(True, alpha=0.3)
-        
+
         fig.suptitle(f't-SNE Feature Space - Epoch {epoch}', fontsize=14, fontweight='bold')
         plt.tight_layout()
-        
-        # Save
+
         save_path = self.save_dir / f'tsne_epoch_{epoch:03d}.png'
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()

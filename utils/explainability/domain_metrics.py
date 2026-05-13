@@ -37,12 +37,7 @@ class DomainAccuracyTracker:
     """
     
     def __init__(self, window_size: int = 100):
-        """
-        Initialize tracker.
-        
-        Args:
-            window_size: Size of moving average window
-        """
+        """Initialize tracker."""
         self.window_size = window_size
         
         # Running statistics
@@ -90,13 +85,11 @@ class DomainAccuracyTracker:
             target_correct = (domain_pred_target <= 0).float().sum().item()
             target_total = domain_pred_target.numel()   # = B
 
-        # Update running stats
         self._source_correct.append(source_correct)
         self._target_correct.append(target_correct)
         self._total_source.append(source_total)
         self._total_target.append(target_total)
 
-        # Track for epoch averaging
         self._current_epoch_source.append((source_correct, source_total))
         self._current_epoch_target.append((target_correct, target_total))
     
@@ -130,13 +123,7 @@ class DomainAccuracyTracker:
         return sum(self._target_correct) / total
     
     def end_epoch(self, epoch: int):
-        """
-        Finalize epoch and store summary.
-        
-        Args:
-            epoch: Current epoch number
-        """
-        # Calculate epoch averages
+        """Finalize epoch and store summary."""
         source_correct = sum(s for s, _ in self._current_epoch_source)
         source_total = sum(t for _, t in self._current_epoch_source)
         target_correct = sum(s for s, _ in self._current_epoch_target)
@@ -155,8 +142,7 @@ class DomainAccuracyTracker:
         }
         
         self.history.append(row)
-        
-        # Clear epoch data
+
         self._current_epoch_source.clear()
         self._current_epoch_target.clear()
         

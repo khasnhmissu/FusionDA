@@ -37,7 +37,6 @@ def gaussian_kernel(x, y, sigma=None):
     Returns:
         [N, M] kernel matrix
     """
-    # Compute pairwise squared distances
     xx = torch.sum(x ** 2, dim=1, keepdim=True)  # [N, 1]
     yy = torch.sum(y ** 2, dim=1, keepdim=True)  # [M, 1]
     xy = torch.mm(x, y.t())  # [N, M]
@@ -74,18 +73,16 @@ def compute_mmd(source_features, target_features, kernel='gaussian'):
     if source_features is None or target_features is None:
         return 0.0
     
-    # Handle numpy arrays
     if isinstance(source_features, np.ndarray):
         source_features = torch.from_numpy(source_features).float()
     if isinstance(target_features, np.ndarray):
         target_features = torch.from_numpy(target_features).float()
-    
-    # Flatten if needed (e.g., from [B, C, H, W] to [B, C*H*W])
+
     if source_features.dim() > 2:
         source_features = source_features.view(source_features.size(0), -1)
     if target_features.dim() > 2:
         target_features = target_features.view(target_features.size(0), -1)
-    
+
     # Move to CPU and convert to float32 for computation (handles Half precision)
     source_features = source_features.detach().cpu().float()
     target_features = target_features.detach().cpu().float()
@@ -96,7 +93,6 @@ def compute_mmd(source_features, target_features, kernel='gaussian'):
     if n_s == 0 or n_t == 0:
         return 0.0
     
-    # Compute kernel matrices
     if kernel == 'gaussian':
         K_ss = gaussian_kernel(source_features, source_features)
         K_tt = gaussian_kernel(target_features, target_features)
@@ -162,16 +158,7 @@ class MMDTracker:
         features_tr: torch.Tensor = None,
         features_tf: torch.Tensor = None,
     ):
-        """
-        Compute and store MMD values for current batch.
-        
-        Args:
-            epoch: Current epoch
-            features_sr: Source Real features [B, C, H, W] or [B, D]
-            features_sf: Source Fake features
-            features_tr: Target Real features
-            features_tf: Target Fake features
-        """
+        """Compute and store MMD values for current batch."""
         mmd_sr_tr = compute_mmd(features_sr, features_tr) if features_sr is not None and features_tr is not None else None
         mmd_sf_tf = compute_mmd(features_sf, features_tf) if features_sf is not None and features_tf is not None else None
         mmd_sr_sf = compute_mmd(features_sr, features_sf) if features_sr is not None and features_sf is not None else None
@@ -187,12 +174,7 @@ class MMDTracker:
             self.current_epoch_data['mmd_tr_tf'].append(mmd_tr_tf)
     
     def end_epoch(self, epoch: int):
-        """
-        Finalize epoch - compute averages and store.
-        
-        Args:
-            epoch: Current epoch number
-        """
+        """Finalize epoch — compute averages and store."""
         row = {'epoch': epoch}
         
         for key, values in self.current_epoch_data.items():

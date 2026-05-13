@@ -1,0 +1,95 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FusionDA training config — YOLOv5m backbone
+# ─────────────────────────────────────────────────────────────────────────────
+# Purpose
+#   Provide a same-backbone comparison point against ALDI++ YOLOv5m.
+#   ALDI's reference configs:
+#     - configs/cityscapes/Base-Yolo-CSsplit2cls.yaml  (source-only burnin)
+#     - configs/cityscapes/ALDI-Yolo-CSsplit2cls.yaml  (ALDI++)
+#
+# Backbone notes
+#   "yolov5mu.pt" is Ultralytics' anchor-free port of YOLOv5m.
+#   It pairs YOLOv5's CSP backbone (C3 + SPPF) with the YOLOv8 anchor-free Detect
+#   head, which is the variant compatible with Ultralytics' v8DetectionLoss
+#   path that FusionDA wraps in fusion_da.py:8-13.
+#
+#   ALDI's official YOLOv5m uses the *original* anchor-based head from the
+#   YOLOv5 repo. Numerical parity with ALDI source-only is therefore not exact;
+#   what we do prove is that FusionDA's relative gain (Δrel) holds when the
+#   architecture confound is removed (same one-stage YOLOv5 backbone family).
+#
+#   See docs/yolov5m_fairness.md for the full fairness rationale.
+#
+# Hyperparameter choices
+#   Image size, batch, epochs, optimizer match the YOLO26-s configuration used
+#   for Bảng 4.2 in c4_chapter.tex so the new row is a like-for-like add.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Model & Data
+model:
+  weights: "yolov5mu.pt"          # Ultralytics anchor-free YOLOv5m (auto-download)
+  imgsz: 320                       # match YOLO26-s chapter setting (Bảng 4.1)
+
+data:
+  config: "configs/data/data.yaml" # already 2-class (person, car) — matches CSsplit2cls
+  workers: 8
+  batch_size: 4                    # match the YOLO26-s rows in Bảng 4.1
+
+# Training Schedule
+training:
+  epochs: 40                       # match Bảng 4.1: "40 epochs" for YOLO26 rows
+  warmup_epochs: 3                 # detection-loss warmup before DA losses kick in
+  lr0: 0.0001                      # AdamW base LR (FusionDA convention)
+  lrf: 0.01                        # final LR multiplier
+  device: "0"
+
+# Mean Teacher EMA
+# Same formulation as the YOLO26 config (configs/train_config.yaml)
+teacher:
+  alpha: 0.9999
+  update_after_step: 2000
+  alpha_rampup_steps: 5000
+
+# Burn-in: no distillation during early epochs to avoid confirmation bias
+burn_in:
+  epochs: 10
+
+# Distillation (Teacher → Student)
+distillation:
+  conf_thres_min: 0.1
+  conf_thres_max: 0.5
+  iou_thres: 0.45
+  lambda_weight: 0.1
+  use_progressive_lambda: true
+
+  class_mapping:
+    0: 0
+    1: 1
+    2: 1
+
+# Domain Adversarial (GRL)
+grl:
+  enabled: true
+  warmup_epochs: 20
+  max_alpha: 1.0
+  weight: 0.05
+  hidden_dim: 512
+  dropout: 0.1
+  lr: 0.00005
+
+# Output
+output:
+  project: "runs/fda"
+  name: "fusionda_yolov5m"
+
+logging:
+  log_interval: 100
+  val_interval: 10
+  save_interval: 10
+  enable_monitoring: true
+
+# Performance
+performance:
+  amp: true
+  cache_clear_interval: 200
+  gradient_clip: 2.0

@@ -58,38 +58,25 @@ class TrainingLogger:
         log_interval: int = 10,  # Log every N iterations
         verbose: bool = True,
     ):
-        """
-        Initialize logger.
-        
-        Args:
-            save_dir: Directory to save logs
-            project_name: Name for logging headers
-            use_tensorboard: Enable TensorBoard logging
-            log_interval: Iterations between console logs
-            verbose: Print initialization info
-        """
+        """Initialize logger."""
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         
         self.project_name = project_name
         self.log_interval = log_interval
         self.verbose = verbose
-        
-        # Tracking data
+
         self.iteration_data = []  # Per-iteration losses
         self.epoch_data = []      # Per-epoch metrics
         self.start_time = time.time()
         self.current_epoch = 0
-        
-        # Running averages for current epoch
+
         self._epoch_losses = defaultdict(list)
-        
-        # CSV files
+
         self.iteration_csv = self.save_dir / 'iteration_losses.csv'
         self.epoch_csv = self.save_dir / 'epoch_metrics.csv'
         self.config_file = self.save_dir / 'training_config.json'
-        
-        # TensorBoard
+
         self.tb_writer = None
         if use_tensorboard and TENSORBOARD_AVAILABLE:
             self.tb_writer = SummaryWriter(str(self.save_dir / 'tensorboard'))
@@ -98,8 +85,7 @@ class TrainingLogger:
         elif use_tensorboard and not TENSORBOARD_AVAILABLE:
             if verbose:
                 print("[Logger] Warning: TensorBoard not available. Install with: pip install tensorboard")
-        
-        # Track column order
+
         self._iter_columns = None
         self._epoch_columns = None
         
@@ -107,12 +93,7 @@ class TrainingLogger:
             print(f"[Logger] Initialized. Save dir: {self.save_dir}")
     
     def log_config(self, config: dict):
-        """
-        Save training configuration.
-        
-        Args:
-            config: Dictionary of training parameters
-        """
+        """Save training configuration to JSON."""
         config['log_start_time'] = datetime.now().isoformat()
         with open(self.config_file, 'w') as f:
             json.dump(config, f, indent=2, default=str)
@@ -125,19 +106,9 @@ class TrainingLogger:
         extra: dict = None,
         global_step: int = None,
     ):
-        """
-        Log losses for a single iteration.
-        
-        Args:
-            epoch: Current epoch
-            iteration: Iteration within epoch
-            losses: Dictionary of loss values (e.g., {'loss_sr': 0.5})
-            extra: Additional values to log (e.g., {'lr': 0.001})
-            global_step: Global step (auto-calculated if None)
-        """
+        """Log losses for a single iteration."""
         self.current_epoch = epoch
-        
-        # Build row
+
         row = {
             'epoch': epoch,
             'iteration': iteration,
@@ -146,15 +117,12 @@ class TrainingLogger:
         row.update(losses)
         if extra:
             row.update(extra)
-        
-        # Track for epoch averaging
+
         for k, v in losses.items():
             self._epoch_losses[k].append(v)
-        
-        # Store data
+
         self.iteration_data.append(row)
-        
-        # TensorBoard logging
+
         if self.tb_writer and global_step is not None:
             for k, v in losses.items():
                 self.tb_writer.add_scalar(f'train/{k}', v, global_step)
@@ -169,21 +137,12 @@ class TrainingLogger:
         metrics: dict,
         extra: dict = None,
     ):
-        """
-        Log metrics for a complete epoch.
-        
-        Args:
-            epoch: Current epoch
-            metrics: Dictionary of metric values (e.g., {'mAP50': 0.85})
-            extra: Additional values to log
-        """
-        # Calculate epoch averages
+        """Log metrics for a complete epoch."""
         avg_losses = {}
         for k, v_list in self._epoch_losses.items():
             if v_list:
                 avg_losses[f'{k}_avg'] = sum(v_list) / len(v_list)
         
-        # Build row
         row = {
             'epoch': epoch,
             'timestamp': time.time() - self.start_time,
@@ -192,31 +151,22 @@ class TrainingLogger:
         row.update(metrics)
         if extra:
             row.update(extra)
-        
-        # Store
+
         self.epoch_data.append(row)
-        
-        # TensorBoard
+
         if self.tb_writer:
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):
                     self.tb_writer.add_scalar(f'metrics/{k}', v, epoch)
             for k, v in avg_losses.items():
                 self.tb_writer.add_scalar(f'epoch/{k}', v, epoch)
-        
-        # Reset epoch accumulators
+
         self._epoch_losses.clear()
-        
-        # Save periodically
+
         self._save_csvs()
     
     def get_pbar_dict(self) -> dict:
-        """
-        Get dictionary for tqdm progress bar display.
-        
-        Returns:
-            dict: Current epoch averages for display
-        """
+        """Get current epoch loss averages formatted for tqdm display."""
         result = {}
         for k, v_list in self._epoch_losses.items():
             if v_list:
@@ -227,7 +177,6 @@ class TrainingLogger:
     
     def _save_csvs(self):
         """Save data to CSV files."""
-        # Iteration CSV
         if self.iteration_data:
             if self._iter_columns is None:
                 self._iter_columns = list(self.iteration_data[0].keys())
@@ -236,8 +185,7 @@ class TrainingLogger:
                 writer = csv.DictWriter(f, fieldnames=self._iter_columns, extrasaction='ignore')
                 writer.writeheader()
                 writer.writerows(self.iteration_data)
-        
-        # Epoch CSV
+
         if self.epoch_data:
             if self._epoch_columns is None:
                 self._epoch_columns = list(self.epoch_data[0].keys())
@@ -252,16 +200,13 @@ class TrainingLogger:
         Finalize logging - save all data, generate charts, and close writers.
         Call this at the end of training.
         """
-        # Save final CSVs
         self._save_csvs()
-        
-        # Generate loss charts
+
         try:
             self.plot_loss_charts()
         except Exception as e:
             print(f"[Logger] Warning: Chart generation failed: {e}")
         
-        # Log training duration
         total_time = time.time() - self.start_time
         summary = {
             'total_epochs': len(self.epoch_data),
@@ -272,8 +217,7 @@ class TrainingLogger:
         
         with open(self.save_dir / 'training_summary.json', 'w') as f:
             json.dump(summary, f, indent=2)
-        
-        # Close TensorBoard
+
         if self.tb_writer:
             self.tb_writer.close()
         
@@ -314,7 +258,6 @@ class TrainingLogger:
             print("[Logger] No iteration data to plot.")
             return
         
-        # ── Collect per-epoch averages from iteration data ──────────────
         epoch_avg = defaultdict(lambda: defaultdict(list))
         for row in self.iteration_data:
             ep = row.get('epoch', 0)
@@ -322,7 +265,6 @@ class TrainingLogger:
                 if k.startswith('loss_') and isinstance(v, (int, float)):
                     epoch_avg[k][ep].append(v)
         
-        # Compute averages
         loss_names = sorted(epoch_avg.keys())
         epochs_set = sorted({row.get('epoch', 0) for row in self.iteration_data})
         
@@ -334,7 +276,6 @@ class TrainingLogger:
                 avgs.append(sum(vals) / len(vals) if vals else 0.0)
             avg_data[name] = avgs
         
-        # ── Chart style ─────────────────────────────────────────────────
         colors = {
             'loss_source':      '#2196F3',  # Blue
             'loss_source_fake': '#4CAF50',  # Green
@@ -354,7 +295,6 @@ class TrainingLogger:
             'font.size':        11,
         })
         
-        # ── 1. Combined loss components chart ───────────────────────────
         fig, ax = plt.subplots(figsize=(14, 7))
         for name in loss_names:
             if name == 'loss_total':
@@ -372,7 +312,6 @@ class TrainingLogger:
         fig.savefig(chart_dir / 'loss_components.png', dpi=150)
         plt.close(fig)
         
-        # ── 2. Total loss chart ─────────────────────────────────────────
         if 'loss_total' in avg_data:
             fig, ax = plt.subplots(figsize=(12, 6))
             ax.plot(epochs_set, avg_data['loss_total'], color=colors['loss_total'],
@@ -387,7 +326,6 @@ class TrainingLogger:
             fig.savefig(chart_dir / 'loss_total.png', dpi=150)
             plt.close(fig)
         
-        # ── 3. Individual loss charts ───────────────────────────────────
         for name in loss_names:
             fig, ax = plt.subplots(figsize=(10, 5))
             color = colors.get(name, '#333333')
@@ -402,7 +340,6 @@ class TrainingLogger:
             fig.savefig(chart_dir / f'{name}.png', dpi=150)
             plt.close(fig)
         
-        # ── 4. Metrics chart (mAP, precision, recall) ──────────────────
         if self.epoch_data:
             metric_names = ['mAP50', 'mAP50-95', 'precision', 'recall']
             has_metrics = any(
@@ -420,7 +357,6 @@ class TrainingLogger:
                 for m in metric_names:
                     vals = [row.get(m, None) for row in self.epoch_data]
                     eps  = [row.get('epoch', i) for i, row in enumerate(self.epoch_data)]
-                    # Filter out None values
                     filtered = [(e, v) for e, v in zip(eps, vals) if v is not None]
                     if filtered:
                         e_list, v_list = zip(*filtered)
@@ -438,7 +374,6 @@ class TrainingLogger:
                 fig.savefig(chart_dir / 'metrics.png', dpi=150)
                 plt.close(fig)
         
-        # ── 5. Domain accuracy chart ───────────────────────────────────
         domain_acc_data = defaultdict(list)
         for row in self.iteration_data:
             ep = row.get('epoch', 0)
@@ -476,33 +411,26 @@ class TrainingLogger:
 
 
 def load_training_log(log_dir: str) -> dict:
-    """
-    Load training logs from a directory.
-    
-    Args:
-        log_dir: Path to training log directory
-        
+    """Load training logs from a directory.
+
     Returns:
-        dict: {'iteration': DataFrame, 'epoch': DataFrame, 'config': dict}
+        dict: {'iteration': list, 'epoch': list, 'config': dict}
     """
     log_dir = Path(log_dir)
     result = {}
-    
-    # Load iteration CSV
+
     iter_csv = log_dir / 'iteration_losses.csv'
     if iter_csv.exists():
         with open(iter_csv, 'r') as f:
             reader = csv.DictReader(f)
             result['iteration'] = list(reader)
-    
-    # Load epoch CSV
+
     epoch_csv = log_dir / 'epoch_metrics.csv'
     if epoch_csv.exists():
         with open(epoch_csv, 'r') as f:
             reader = csv.DictReader(f)
             result['epoch'] = list(reader)
-    
-    # Load config
+
     config_file = log_dir / 'training_config.json'
     if config_file.exists():
         with open(config_file, 'r') as f:

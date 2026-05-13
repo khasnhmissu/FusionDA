@@ -117,7 +117,6 @@ def load_config(config_path: Optional[str] = None) -> FDAConfig:
     if yaml_config is None:
         return config
     
-    # Update each section
     section_mapping = {
         'model': config.model,
         'data': config.data,
@@ -143,40 +142,33 @@ def load_config(config_path: Optional[str] = None) -> FDAConfig:
 def config_to_namespace(config: FDAConfig) -> Namespace:
     """Convert FDAConfig to flat Namespace for backward compatibility."""
     ns = Namespace()
-    
-    # Model
+
     ns.weights = config.model.weights
     ns.imgsz = config.model.imgsz
-    
-    # Data
+
     ns.data = config.data.config
     ns.workers = config.data.workers
     ns.batch = config.data.batch_size
-    
-    # Training
+
     ns.epochs = config.training.epochs
     ns.warmup_epochs = config.training.warmup_epochs
     ns.lr0 = config.training.lr0
     ns.lrf = config.training.lrf
     ns.device = config.training.device
-    
-    # Teacher
+
     ns.teacher_alpha = config.teacher.alpha
     ns.update_after_step = config.teacher.update_after_step
     ns.alpha_rampup_steps = config.teacher.alpha_rampup_steps
-    
-    # Burn-in
+
     ns.burn_in_epochs = config.burn_in.epochs
-    
-    # Distillation
+
     ns.conf_thres = config.distillation.conf_thres_min
     ns.conf_thres_max = config.distillation.conf_thres_max
     ns.iou_thres = config.distillation.iou_thres
     ns.lambda_weight = config.distillation.lambda_weight
     ns.use_progressive_lambda = config.distillation.use_progressive_lambda
     ns.class_mapping = config.distillation.class_mapping
-    
-    # GRL
+
     ns.use_grl = config.grl.enabled
     ns.grl_warmup = config.grl.warmup_epochs
     ns.grl_max_alpha = config.grl.max_alpha
@@ -184,18 +176,15 @@ def config_to_namespace(config: FDAConfig) -> Namespace:
     ns.grl_hidden_dim = config.grl.hidden_dim
     ns.grl_dropout = config.grl.dropout
     ns.grl_lr = config.grl.lr
-    
-    # Output
+
     ns.project = config.output.project
     ns.name = config.output.name
-    
-    # Logging
+
     ns.log_interval = config.logging.log_interval
     ns.val_interval = config.logging.val_interval
     ns.save_interval = config.logging.save_interval
     ns.enable_monitoring = config.logging.enable_monitoring
-    
-    # Performance
+
     ns.amp = config.performance.amp
     ns.cache_clear_interval = config.performance.cache_clear_interval
     ns.gradient_clip = config.performance.gradient_clip

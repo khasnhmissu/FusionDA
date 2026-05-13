@@ -1,0 +1,64 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FusionDA training config — Faster R-CNN R-50-FPN backbone
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   ALDI++   (R-50-FPN, Faster R-CNN, Detectron2)        ← reference 1
+#   DA-Detect (R-50-FPN, Faster R-CNN, maskrcnn_benchmark) ← reference 2
+#   FusionDA (R-50-FPN, Faster R-CNN, torchvision)        ← THIS config
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Data
+data:               configs/data/data.yaml      # already 2-class (person, car)
+imgsz:              640                          # match YOLO chapter rows
+workers:            4
+batch:              4
+
+# Schedule  — defaults match FusionDA YOLO (train.py:278 warmup=5,
+# train.py:1016 gradient_clip=2.0).
+epochs:             40                           # match Bảng 4.1 convention
+warmup_epochs:      5
+lr0:                0.0001                       # AdamW base LR — FusionDA convention
+lrf:                0.01
+optimizer:          adamw                        # set "sgd" for ALDI-style recipe
+gradient_clip:      2.0                          # train.py default; bump to 5.0 for ALDI recipe
+
+# Teacher EMA (Mean Teacher) — matches train.py CLI defaults used by 05_grl.sh
+teacher_alpha:      0.9999
+update_after_step:  500
+alpha_rampup_steps: 2000
+burn_in_epochs:     5                            # no distillation during burn-in
+
+# Distillation (teacher → student via pseudo-labels on target domain)
+# train.py:79 hardcodes TEACHER_CONF_THRES=0.5 (overrides --conf-thres flag).
+conf_thres:         0.5
+lambda_weight:      0.2                          # matches train.py CLI default
+use_progressive_lambda: true
+
+# Cosine consistency: φ(I^s) ↔ φ(I^sf)
+consistency_weight: 0.5
+
+# Source-fake supervised loss weight
+source_fake_weight: 0.1
+
+# GRL adversarial alignment
+use_grl:            true
+grl_warmup:         5                            # epochs of pure detection before GRL
+grl_max_alpha:      1.0
+grl_weight:         0.05
+grl_hidden_dim:     512
+grl_dropout:        0.1
+grl_lr:             0.00005
+
+# FPN level for hook ('0'=P2 stride 4, '1'=P3 stride 8, '2'=P4 stride 16,
+# '3'=P5 stride 32).  P4 default — balanced spatial-vs-semantic.
+fpn_level:          "2"
+
+# Output
+project:            runs/fda_fasterrcnn
+name:               fusionda_r50fpn
+
+# Misc
+amp:                true                         # enable on CUDA only (auto-disabled on CPU)
+val_interval:       5
+save_interval:      10

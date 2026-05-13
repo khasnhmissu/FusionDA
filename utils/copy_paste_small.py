@@ -280,7 +280,6 @@ def apply_small_copy_paste(
     if len(bboxes) == 0:
         return batch_item
     
-    # img shape: (C, H, W) uint8 tensor
     if isinstance(img, torch.Tensor):
         _, img_h, img_w = img.shape
     elif isinstance(img, np.ndarray):
@@ -291,7 +290,6 @@ def apply_small_copy_paste(
     else:
         return batch_item
     
-    # Ensure tensors
     if isinstance(bboxes, np.ndarray):
         bboxes = torch.from_numpy(bboxes).float()
     if isinstance(cls, np.ndarray):
@@ -299,11 +297,9 @@ def apply_small_copy_paste(
     
     cls_flat = cls.view(-1)
 
-    # ------------------------------------------------------------------
     # Source selection — prefer medium / large objects whose rich detail
     # produces CLEAN small samples after downscaling. Falls back to small
     # sources only if no medium/large exists (rare in Cityscapes).
-    # ------------------------------------------------------------------
     w_px = bboxes[:, 2] * img_w
     h_px = bboxes[:, 3] * img_h
     max_side = torch.max(w_px, h_px)
@@ -317,13 +313,11 @@ def apply_small_copy_paste(
     else:
         return batch_item
 
-    # Current boxes in xyxy for IoU checking.
     all_boxes_xyxy = _xywhn_to_xyxy(bboxes, img_h, img_w)
 
     new_boxes = []
     new_cls = []
 
-    # Convert img to HWC numpy for pixel manipulation.
     if isinstance(img, torch.Tensor):
         img_np = img.numpy() if not img.is_cuda else img.cpu().numpy()
         img_is_tensor = True
@@ -339,13 +333,11 @@ def apply_small_copy_paste(
 
     img_modified = img_np.copy()
 
-    # ------------------------------------------------------------------
     # Resolve the SOURCE image from which pixel crops will be extracted.
     # - If `source_image` is supplied (typical in paired mode: always pass
     #   the CLEAR source_real image for both real/fake calls), use that.
     # - Otherwise fall back to the destination image itself (standalone
     #   mode: crop and paste within the same image — original Kisantal).
-    # ------------------------------------------------------------------
     if source_image is not None:
         src_img = source_image
         if isinstance(src_img, torch.Tensor):
@@ -362,19 +354,15 @@ def apply_small_copy_paste(
     else:
         src_img = img_modified
 
-    # ------------------------------------------------------------------
     # Detect actual content area on the DESTINATION image — letterbox /
     # mosaic padding is masked out so pastes never land on gray bars.
-    # ------------------------------------------------------------------
     content_box = _find_content_area(img_modified)
     cx1, cy1, cx2, cy2 = content_box
     if (cx2 - cx1) < 32 or (cy2 - cy1) < 32:
         return batch_item   # content region degenerate — skip augmentation
 
-    # ------------------------------------------------------------------
     # Per-image paste budget (not per source object — avoids exploding
     # paste counts when the image already has many objects).
-    # ------------------------------------------------------------------
     n_pastes = rng.randint(1, max_copies)
 
     # Target paste size in COCO small-band, bounded to [24, 40] px.
@@ -386,7 +374,6 @@ def apply_small_copy_paste(
     target_size_max = min(40.0, float(small_thr) * 1.4)
 
     for _ in range(n_pastes):
-        # Pick a random source object from the pool.
         si = rng.choice(source_indices)
         obj_cls = int(cls_flat[si].item())
         obj_box = bboxes[si]
@@ -422,10 +409,8 @@ def apply_small_copy_paste(
         if crop_std < 5.0:
             continue
 
-        # Target max-side in the COCO "small" band (20-45 px).
         target_size = rng.uniform(target_size_min, target_size_max)
 
-        # Preserve aspect ratio when resizing to target_size.
         aspect = crop_w / float(crop_h)
         if aspect >= 1.0:
             new_w = max(3, int(round(target_size)))
@@ -471,7 +456,6 @@ def apply_small_copy_paste(
         if ious.numel() > 0 and ious.max() > max_overlap_iou:
             continue
 
-        # Destination region (used for colour match + alpha blend).
         target_region = img_modified[tgt_y1:tgt_y2, tgt_x1:tgt_x2]
         if target_region.size == 0:
             continue
@@ -516,17 +500,14 @@ def apply_small_copy_paste(
     if not new_boxes:
         return batch_item
     
-    # Convert back to CHW if needed
     if was_chw:
         img_modified = img_modified.transpose(2, 0, 1)  # HWC → CHW
     
-    # Update image
     if img_is_tensor:
         batch_item['img'] = torch.from_numpy(img_modified)
     else:
         batch_item['img'] = img_modified
     
-    # Append new boxes to labels
     new_boxes_xyxy = torch.stack(new_boxes)  # (M, 4) pixel xyxy
     new_boxes_xywhn = _xyxy_to_xywhn(new_boxes_xyxy, img_h, img_w)  # (M, 4) normalized
     new_cls_tensor = torch.tensor(new_cls, dtype=cls.dtype).view(-1, 1) if cls.dim() == 2 \
