@@ -1,0 +1,69 @@
+# FusionDA — WIDERFACE (1 class: face)
+# =====================================
+
+# Model & Data
+model:
+  weights: "yolo26m.pt"
+  imgsz: 1024
+
+data:
+  config: "configs/data/data_wider.yaml"
+  workers: 8
+  batch_size: 4
+
+# Training Schedule
+training:
+  epochs: 50
+  warmup_epochs: 5
+  lr0: 0.0001
+  lrf: 0.01
+  device: "0"
+
+# Mean Teacher EMA
+teacher:
+  alpha: 0.9999
+  update_after_step: 2000
+  alpha_rampup_steps: 5000
+
+# Burn-in: no distillation in first N epochs
+burn_in:
+  epochs: 10
+
+# Distillation (Teacher → Student)
+distillation:
+  conf_thres_min: 0.1
+  conf_thres_max: 0.5
+  iou_thres: 0.45
+  lambda_weight: 0.1
+  use_progressive_lambda: true
+  # Single-class dataset: teacher's face (idx 0) → student's face (idx 0).
+  # Anything else is filtered out by NMS `classes=[0]`.
+  class_mapping:
+    0: 0    # face
+
+# Domain Adversarial (GRL)
+grl:
+  enabled: true
+  warmup_epochs: 10
+  max_alpha: 1.0
+  weight: 0.05
+  hidden_dim: 512
+  dropout: 0.1
+  lr: 0.00005
+
+# Output
+output:
+  project: "runs/fda_wider"
+  name: "exp"
+
+logging:
+  log_interval: 100
+  val_interval: 5
+  save_interval: 10
+  enable_monitoring: true
+
+# Performance
+performance:
+  amp: true
+  cache_clear_interval: 200
+  gradient_clip: 2.0

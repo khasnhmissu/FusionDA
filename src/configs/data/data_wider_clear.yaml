@@ -1,0 +1,11 @@
+# WIDERFACE Clear Domain (source_real)
+# =====================================
+path: datasets
+
+nc: 1
+names:
+  0: face
+
+train: wider/wider/train/images
+val: wider/wider/val/images
+test: wider/wider/val/images

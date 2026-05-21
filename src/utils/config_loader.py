@@ -1,0 +1,238 @@
+"""Configuration loader for FusionDA training."""
+import yaml
+from pathlib import Path
+from typing import Dict, Any, Optional
+from dataclasses import dataclass, field
+from argparse import Namespace
+
+
+@dataclass
+class ModelConfig:
+    weights: str = "yolo26s.pt"
+    imgsz: int = 640
+
+
+@dataclass
+class DataConfig:
+    config: str = "configs/data/data.yaml"
+    workers: int = 8
+    batch_size: int = 4
+
+
+@dataclass
+class TrainingConfig:
+    epochs: int = 200
+    warmup_epochs: int = 10
+    lr0: float = 0.001
+    lrf: float = 0.01
+    device: str = "0"
+
+
+@dataclass
+class TeacherConfig:
+    """EMA config: θ_teacher = α_eff * θ_teacher + (1-α_eff) * θ_student"""
+    alpha: float = 0.999
+    update_after_step: int = 2000      # Delay before first EMA update
+    alpha_rampup_steps: int = 5000     # Cosine ramp-up for α_eff
+
+
+@dataclass
+class BurnInConfig:
+    """No distillation during burn-in to prevent confirmation bias."""
+    epochs: int = 20
+
+
+@dataclass
+class DistillationConfig:
+    conf_thres_min: float = 0.5
+    conf_thres_max: float = 0.7
+    iou_thres: float = 0.45
+    lambda_weight: float = 0.1
+    use_progressive_lambda: bool = True
+    class_mapping: Dict[int, int] = field(default_factory=lambda: {0: 0, 1: 1, 2: 1})
+
+
+@dataclass
+class GRLConfig:
+    enabled: bool = True
+    warmup_epochs: int = 20
+    max_alpha: float = 1.0         # was 0.3 — too weak, discriminator always won
+    weight: float = 0.05           # was 0.02 — overwhelmed by detection loss
+    hidden_dim: int = 512
+    dropout: float = 0.1           # was 0.3 — inconsistent learning hurt disc accuracy
+    lr: float = 0.00005            # was 1e-4 — discriminator was learning too fast vs backbone
+
+
+@dataclass
+class OutputConfig:
+    project: str = "runs/fda"
+    name: str = "exp"
+
+
+@dataclass
+class LoggingConfig:
+    log_interval: int = 100
+    val_interval: int = 10
+    save_interval: int = 10
+    enable_monitoring: bool = True
+
+
+@dataclass
+class PerformanceConfig:
+    amp: bool = True
+    cache_clear_interval: int = 200
+    gradient_clip: float = 10.0
+
+
+@dataclass
+class FDAConfig:
+    """Main configuration container."""
+    model: ModelConfig = field(default_factory=ModelConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    teacher: TeacherConfig = field(default_factory=TeacherConfig)
+    burn_in: BurnInConfig = field(default_factory=BurnInConfig)
+    distillation: DistillationConfig = field(default_factory=DistillationConfig)
+    grl: GRLConfig = field(default_factory=GRLConfig)
+    output: OutputConfig = field(default_factory=OutputConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
+
+
+def load_config(config_path: Optional[str] = None) -> FDAConfig:
+    """Load configuration from YAML file."""
+    config = FDAConfig()
+    
+    if config_path is None:
+        return config
+    
+    config_file = Path(config_path)
+    if not config_file.exists():
+        print(f"Warning: Config file {config_path} not found. Using defaults.")
+        return config
+    
+    with open(config_file, 'r') as f:
+        yaml_config = yaml.safe_load(f)
+    
+    if yaml_config is None:
+        return config
+    
+    section_mapping = {
+        'model': config.model,
+        'data': config.data,
+        'training': config.training,
+        'teacher': config.teacher,
+        'burn_in': config.burn_in,
+        'distillation': config.distillation,
+        'grl': config.grl,
+        'output': config.output,
+        'logging': config.logging,
+        'performance': config.performance,
+    }
+    
+    for section_name, section_obj in section_mapping.items():
+        if section_name in yaml_config:
+            for k, v in yaml_config[section_name].items():
+                if hasattr(section_obj, k):
+                    setattr(section_obj, k, v)
+    
+    return config
+
+
+def config_to_namespace(config: FDAConfig) -> Namespace:
+    """Convert FDAConfig to flat Namespace for backward compatibility."""
+    ns = Namespace()
+
+    ns.weights = config.model.weights
+    ns.imgsz = config.model.imgsz
+
+    ns.data = config.data.config
+    ns.workers = config.data.workers
+    ns.batch = config.data.batch_size
+
+    ns.epochs = config.training.epochs
+    ns.warmup_epochs = config.training.warmup_epochs
+    ns.lr0 = config.training.lr0
+    ns.lrf = config.training.lrf
+    ns.device = config.training.device
+
+    ns.teacher_alpha = config.teacher.alpha
+    ns.update_after_step = config.teacher.update_after_step
+    ns.alpha_rampup_steps = config.teacher.alpha_rampup_steps
+
+    ns.burn_in_epochs = config.burn_in.epochs
+
+    ns.conf_thres = config.distillation.conf_thres_min
+    ns.conf_thres_max = config.distillation.conf_thres_max
+    ns.iou_thres = config.distillation.iou_thres
+    ns.lambda_weight = config.distillation.lambda_weight
+    ns.use_progressive_lambda = config.distillation.use_progressive_lambda
+    ns.class_mapping = config.distillation.class_mapping
+
+    ns.use_grl = config.grl.enabled
+    ns.grl_warmup = config.grl.warmup_epochs
+    ns.grl_max_alpha = config.grl.max_alpha
+    ns.grl_weight = config.grl.weight
+    ns.grl_hidden_dim = config.grl.hidden_dim
+    ns.grl_dropout = config.grl.dropout
+    ns.grl_lr = config.grl.lr
+
+    ns.project = config.output.project
+    ns.name = config.output.name
+
+    ns.log_interval = config.logging.log_interval
+    ns.val_interval = config.logging.val_interval
+    ns.save_interval = config.logging.save_interval
+    ns.enable_monitoring = config.logging.enable_monitoring
+
+    ns.amp = config.performance.amp
+    ns.cache_clear_interval = config.performance.cache_clear_interval
+    ns.gradient_clip = config.performance.gradient_clip
+    ns.gradient_clip_value = config.performance.gradient_clip
+    
+    return ns
+
+
+def merge_cli_args(config: FDAConfig, args: Namespace) -> FDAConfig:
+    """Merge CLI arguments into config. Only explicitly-provided CLI args take precedence."""
+    import sys
+    
+    cli_mapping = {
+        'weights': ('model', 'weights', '--weights'),
+        'imgsz': ('model', 'imgsz', '--imgsz'),
+        'data': ('data', 'config', '--data'),
+        'workers': ('data', 'workers', '--workers'),
+        'batch': ('data', 'batch_size', '--batch'),
+        'epochs': ('training', 'epochs', '--epochs'),
+        'device': ('training', 'device', '--device'),
+        'lr0': ('training', 'lr0', '--lr0'),
+        'use_grl': ('grl', 'enabled', '--use-grl'),
+        'name': ('output', 'name', '--name'),
+        'project': ('output', 'project', '--project'),
+        'enable_monitoring': ('logging', 'enable_monitoring', '--enable-monitoring'),
+        'teacher_alpha': ('teacher', 'alpha', '--teacher-alpha'),
+    }
+    
+    for arg_name, (section, attr, cli_flag) in cli_mapping.items():
+        # Only override config if user explicitly provided this flag on CLI
+        if cli_flag in sys.argv:
+            arg_value = getattr(args, arg_name, None)
+            if arg_value is not None:
+                section_obj = getattr(config, section)
+                if hasattr(section_obj, attr):
+                    setattr(section_obj, attr, arg_value)
+    
+    return config
+
+
+def print_config(config: FDAConfig):
+    """Print configuration summary."""
+    print("=" * 60)
+    print(f"Model:     {config.model.weights}")
+    print(f"Data:      {config.data.config}")
+    print(f"Epochs:    {config.training.epochs}")
+    print(f"Batch:     {config.data.batch_size}")
+    print(f"Device:    {config.training.device}")
+    print(f"GRL:       {'Enabled' if config.grl.enabled else 'Disabled'}")
+    print(f"Warmup:    {config.training.warmup_epochs} epochs")
+    print("=" * 60)

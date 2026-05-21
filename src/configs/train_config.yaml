@@ -1,0 +1,74 @@
+# Model & Data
+model:
+  weights: "yolo26s.pt"
+  imgsz: 640
+
+data:
+  config: "configs/data/data.yaml"
+  workers: 8
+  batch_size: 4
+
+# Training Schedule
+training:
+  epochs: 100
+  warmup_epochs: 10               # Warmup period (no distillation loss)
+  lr0: 0.0001                     # Initial learning rate
+  lrf: 0.01                       # Final LR multiplier
+  device: "0"
+
+# Mean Teacher EMA
+# Formula: θ_teacher = α_eff * θ_teacher + (1-α_eff) * θ_student
+# α_eff starts at 1.0 (no update) and ramps down to alpha over alpha_rampup_steps
+# Only PARAMETERS updated, BUFFERS (BatchNorm) stay frozen
+# Teacher always in eval mode, update called AFTER optimizer.step()
+teacher:
+  alpha: 0.9999                    # Higher = slower adaptation
+  update_after_step: 2000          # Wait N steps before first EMA update
+  alpha_rampup_steps: 5000         # Cosine ramp-up: α_eff goes 1.0 → alpha
+
+# Burn-in: no distillation during early epochs
+# Student learns ONLY from GT first, preventing confirmation bias
+burn_in:
+  epochs: 10                       # No pseudo labels for first 10 epochs
+
+# Distillation (Teacher → Student knowledge transfer)
+distillation:
+  conf_thres_min: 0.1           
+  conf_thres_max: 0.5             
+  iou_thres: 0.45
+  lambda_weight: 0.1              # Distillation loss weight
+  use_progressive_lambda: true
+  # Class mapping: COCO ID → Dataset ID
+  class_mapping:
+    0: 0    # person
+    2: 1    # car
+
+# Domain Adversarial (GRL)
+# Gradient Reversal Layer aligns source/target feature distributions
+# Architecture: GAP + MLP discriminator (SOTA, stable gradients)
+grl:
+  enabled: true
+  warmup_epochs: 20              # epochs before GRL activates (higher = safer)
+  max_alpha: 1.0                 # max GRL reversal strength (0.3 was too weak → discriminator always won)
+  weight: 0.05                   # domain loss weight (0.02 was too small → GRL signal overwhelmed by det loss)
+  hidden_dim: 512                # discriminator MLP hidden size
+  dropout: 0.1                   # reduced from 0.3 → discriminator learns consistently (not randomly)
+  lr: 0.00005                    # slow discriminator lr so backbone GRL has a fighting chance
+
+# Output
+output:
+  project: "runs/fda"
+  name: "exp"
+
+logging:
+  log_interval: 100
+  val_interval: 10
+  save_interval: 10
+  enable_monitoring: true
+
+# Performance
+performance:
+  amp: true
+  cache_clear_interval: 200
+  gradient_clip: 2.0
+

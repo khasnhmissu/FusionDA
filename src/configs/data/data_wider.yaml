@@ -1,0 +1,38 @@
+# WIDERFACE 4-Domain Paired Dataset
+# ==================================
+# ZIP structure (after extracting under datasets/):
+#   datasets/wider/wider/train/images, datasets/wider/wider/train/labels
+#   datasets/wider/wider/val/images,   datasets/wider/wider/val/labels
+#   datasets/wider_dehazed/wider_dehazed/{train,val}/{images,labels}
+#   datasets/wider_foggy/wider_foggy/{train,val}/{images,labels}
+#   datasets/wider_fake_fog/wider_fake_fog/{train,val}/{images,labels}
+#
+# Domain role mapping (FusionDA):
+#   source_real = wider            (clear, real)
+#   source_fake = wider_dehazed    (clear, GAN-dehazed)
+#   target_real = wider_foggy      (foggy, real)
+#   target_fake = wider_fake_fog   (foggy, fake / fog applied on clear)
+
+path: datasets
+
+# Single-class dataset
+nc: 1
+names:
+  0: face
+
+# Training data paths (train split)
+train_source_real: wider/wider/train/images
+train_source_fake: wider_dehazed/wider_dehazed/train/images
+train_target_real: wider_foggy/wider_foggy/train/images
+train_target_fake: wider_fake_fog/wider_fake_fog/train/images
+
+# Validation data paths (val split)
+val_source_real: wider/wider/val/images
+val_source_fake: wider_dehazed/wider_dehazed/val/images
+val_target_real: wider_foggy/wider_foggy/val/images
+val_target_fake: wider_fake_fog/wider_fake_fog/val/images
+
+# Required by YOLO for training/validation
+train: wider/wider/train/images
+val: wider_foggy/wider_foggy/val/images
+test: wider_foggy/wider_foggy/val/images

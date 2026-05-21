@@ -1,0 +1,11 @@
+# WIDERFACE Foggy Domain (target_real)
+# =====================================
+path: datasets
+
+nc: 1
+names:
+  0: face
+
+train: wider_foggy/wider_foggy/train/images
+val: wider_foggy/wider_foggy/val/images
+test: wider_foggy/wider_foggy/val/images
