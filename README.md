@@ -2,7 +2,7 @@
 
 > **Bachelor's thesis · University of Engineering and Technology, VNU Hanoi**
 > Nguyen Duc Khanh (22028196) — Supervised by Dr. Nguyen Duc Anh, M.Sc. Pham Duc Anh
-> Full report: [📄 Thesis](src\docs\Nguyen Duc Khanh - ENHANCE OBJECT DETECTION PERFORMANCE FOR FOGGY CONDITIONS THROUGH FUSION DOMAIN ADAPTATION.pdf) · [📁 Google Drive folder](https://drive.google.com/drive/folders/1oGmdsR8ylqiAGYIo6MRvbcsjThwuXjNK?usp=sharing)
+> Full report: [📄 Thesis](src/docs/Nguyen%20Duc%20Khanh%20-%20ENHANCE%20OBJECT%20DETECTION%20PERFORMANCE%20FOR%20FOGGY%20CONDITIONS%20THROUGH%20FUSION%20DOMAIN%20ADAPTATION.pdf) · [📁 Google Drive folder](https://drive.google.com/drive/folders/1oGmdsR8ylqiAGYIo6MRvbcsjThwuXjNK?usp=sharing)
 > Checkpoints & generated datasets: [byvn.net/VKY1](https://byvn.net/VKY1)
 
 ---
