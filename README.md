@@ -9,7 +9,7 @@
 
 ## Abstract
 
-Modern object detectors such as YOLO and Faster R-CNN reach high accuracy under clear weather but degrade sharply under fog: atmospheric scattering reduces contrast and shifts the input distribution away from the labelled source domain. **FusionDA** is a semi-supervised domain-adaptation framework that tackles this problem without any label on the foggy (target) side, by combining three complementary mechanisms.
+Modern object detectors such as YOLO and Faster R-CNN reach high accuracy under clear weather but degrade sharply under fog: atmospheric scattering reduces contrast and shifts the input distribution away from the labelled source domain. **FusionDA** is an unsupervised domain-adaptation framework that tackles this problem without any label on the foggy (target) side, by combining three complementary mechanisms.
 
 1. **Physics-based cross-domain image generation.** Instead of an adversarial translator (CycleGAN, CUT), FusionDA synthesises the missing styles deterministically. A monocular depth network ([Depth-Anything-V2](https://github.com/khasnhmissu/Depth-Anything-V2)) plugged into the atmospheric scattering model renders every clear source image as a *pseudo-foggy* view. In the opposite direction, [AOD-Net](https://github.com/khasnhmissu/AOD-Net) dehazes each foggy target image into a *dehazed* (clear-like) view. The synthesised images preserve the original scene structure and therefore reuse the source-side annotations directly.
 2. **Mean-Teacher knowledge distillation.** A teacher built as an EMA of the student processes the *dehazed* images and emits high-confidence pseudo-labels. The student is then supervised by those pseudo-labels on the matching real foggy images, importing target-side knowledge that no labelled set provides.
@@ -17,7 +17,7 @@ Modern object detectors such as YOLO and Faster R-CNN reach high accuracy under 
 
 Trained and evaluated on the standard **Cityscapes ⟶ Foggy Cityscapes** benchmark (classes *person* and *car*) and stress-tested zero-shot on three real-fog test sets (**RTTS**, **Foggy Driving**, **FoggyZurich-test**), FusionDA reaches the highest multi-domain harmonic mean **HM<sub>50</sub><sup>(3)</sup> = 55.37** on YOLO26-l (54.22 on YOLO26-s), surpassing the strongest DAOD baseline (**DA-Detect**, HM = 46.14) by **+17.5% – +20.0%** relative. The improvement is even larger on natural fog: **+24.87 mAP<sub>50</sub> (+77.0% relative) on RTTS** for FusionDA-s, far exceeding the +28.6% gain on synthetic Foggy Cityscapes — strong evidence that FusionDA learns genuinely fog-invariant features rather than overfitting to the synthetic distribution. A supplementary experiment on **WIDERFACE-easy** with `imagecorruptions`-generated fog confirms that the same trend transfers to single-class face detection. Analyses based on Maximum Mean Discrepancy, UMAP visualisation, and C2PSA attention maps further confirm that the domain gap is narrowed at the feature level and that FusionDA avoids the catastrophic forgetting commonly seen in DAOD.
 
-**Keywords:** Object detection · Domain adaptation · Semi-supervised learning · Foggy weather · FusionDA · YOLO26.
+**Keywords:** Object detection · Domain adaptation · Unsupervised learning · Foggy weather · FusionDA · YOLO26.
 
 ---
 

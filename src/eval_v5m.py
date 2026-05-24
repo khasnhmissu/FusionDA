@@ -1,28 +1,4 @@
 """eval_v5m.py — universal evaluation for FusionDA checkpoints.
-
-Sibling of yolo26eval.py.  yolo26eval.py works correctly for YOLO26-s
-checkpoints but silently miscomputes metrics for YOLOv5m checkpoints
-because its ``_detect_nc_from_state_dict`` hardcodes the Detect-head
-layer index as ``model.23.*``:
-
-    YOLO26-s   :  Detect head at layer 23  ✓ matches the hardcoded key
-    YOLOv5mu   :  Detect head at layer 24  ✗ returns None  →
-                  flow falls into the ``strict=False`` load path,
-                  which produces an invalid head and bogus mAP
-
-This file fixes that one issue by scanning **all** layer indices in
-the state_dict for the classification bias tensor
-``model.{N}.(one2one_)?cv3.0.2.bias`` (whose shape is ``[nc]``).  All
-other logic — predictions.json reuse, zero-detection-image FN accounting,
-layout auto-detection, category-id +1 shift detection, COCO size split —
-is reproduced verbatim from ``yolo26eval.py`` so the two scripts produce
-identical numbers on shared inputs (verified by
-``scripts/smoke_test_eval_v5m.py``).
-
-The dataset assumption is FusionDA's 2-class schema (``person, car``).
-Other class schemas would need additional remapping that this script
-deliberately does not perform.
-
 Usage
 =====
 Auto-detect base weights from the checkpoint's head-layer index:

@@ -198,11 +198,6 @@ class PairedMultiDomainDataset(torch.utils.data.Dataset):
     crop augmentation via PairedAugDataset's RNG-seed synchronisation. Cross
     pair seeds are independent, so the source pair and target pair pick
     different augmentations — which is what DA training wants.
-
-    This replaces the old design where each of 4 domains was an independent
-    YOLODataset: mosaic picked different partners per side, flip decided
-    independently → paired losses (consistency, distillation, paired
-    source_fake detection) were operating on spatially mis-aligned tensors.
     """
 
     def __init__(self, source_real_path, source_fake_path,
@@ -301,34 +296,6 @@ class PairedMultiDomainDataset(torch.utils.data.Dataset):
         # with clean geometric features, just rendered in their own domain's
         # palette → pair-pixel alignment preserved and consistency loss
         # remains valid.
-        if self.copy_paste_small:
-            import random as _random
-            from utils.copy_paste_small import apply_small_copy_paste
-            cp_seed = _random.randint(0, 2**31 - 1)
-
-            # Snapshot source_real's image BEFORE the first paste — used as
-            # the pristine CLEAR crop source for both twin calls.
-            clear_src_img = source_real['img']
-            if isinstance(clear_src_img, torch.Tensor):
-                clear_src_img = clear_src_img.clone()
-            else:
-                clear_src_img = clear_src_img.copy()
-
-            source_real = apply_small_copy_paste(
-                source_real,
-                small_thr=self.copy_paste_small_thr,
-                max_copies=self.copy_paste_max_copies,
-                seed=cp_seed,
-                source_image=clear_src_img,
-            )
-            if self.source_pair is not None:
-                source_fake = apply_small_copy_paste(
-                    source_fake,
-                    small_thr=self.copy_paste_small_thr,
-                    max_copies=self.copy_paste_max_copies,
-                    seed=cp_seed,
-                    source_image=clear_src_img,
-                )
 
         # ── Target pair ────────────────────────────────────────────────
         if self.target_pair is not None:
