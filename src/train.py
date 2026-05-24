@@ -1250,7 +1250,7 @@ def parse_args():
     parser.add_argument('--cfg', type=str, default=None, help='custom model.yaml file (e.g. yolov8-p2.yaml)')
     parser.add_argument('--weights', type=str, default='yolo26s.pt')
     parser.add_argument('--data', type=str, default='configs/data/data.yaml')
-    parser.add_argument('--imgsz', type=int, default=1024)
+    parser.add_argument('--imgsz', type=int, default=640)
     
     # Training
     parser.add_argument('--epochs', type=int, default=100)

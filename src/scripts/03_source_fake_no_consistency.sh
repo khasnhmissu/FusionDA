@@ -13,12 +13,12 @@
 # ─────────────────────────────────────────────────────────────────
 set -e
 
-WEIGHTS="yolo26l.pt"
+WEIGHTS="yolo26x.pt"
 DATA="configs/data/data.yaml"
 PROJECT="runs/ablation"
 NAME="03_source_fake_no_consistency"
 EPOCHS=40
-BATCH=2
+BATCH=1
 
 mkdir -p "$PROJECT/$NAME"
 python train.py \

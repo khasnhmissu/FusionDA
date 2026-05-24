@@ -2,7 +2,7 @@
 
 > **Bachelor's thesis · University of Engineering and Technology, VNU Hanoi**
 > Nguyen Duc Khanh (22028196) — Supervised by Dr. Nguyen Duc Anh, M.Sc. Pham Duc Anh
-> Full report: [📄 src/docs/KLTN_NguyenDucKhanh22028196_final_final.pdf](src/docs/KLTN_NguyenDucKhanh22028196_final_final.pdf) · [📁 Google Drive folder](https://drive.google.com/drive/folders/1oGmdsR8ylqiAGYIo6MRvbcsjThwuXjNK?usp=sharing)
+> Full report: [📄 Thesis](src\docs\Nguyen Duc Khanh - ENHANCE OBJECT DETECTION PERFORMANCE FOR FOGGY CONDITIONS THROUGH FUSION DOMAIN ADAPTATION.pdf) · [📁 Google Drive folder](https://drive.google.com/drive/folders/1oGmdsR8ylqiAGYIo6MRvbcsjThwuXjNK?usp=sharing)
 > Checkpoints & generated datasets: [byvn.net/VKY1](https://byvn.net/VKY1)
 
 ---
@@ -24,7 +24,7 @@ Trained and evaluated on the standard **Cityscapes ⟶ Foggy Cityscapes** benchm
 ## 1.  Method overview
 
 <p align="center">
-  <img src="src/docs/full_pipelinee.png" alt="FusionDA full pipeline" width="100%">
+  <img src="src/docs/full_pipeline.png" alt="FusionDA full pipeline" width="100%">
 </p>
 
 - **Phase 1 — Data generation.** Depth-Anything-V2 turns each clear source image $I_s$ into a pseudo-foggy view $I_{sf}$ via the atmospheric scattering model (scattering coefficient sampled as $\beta \sim \mathcal{U}(0.005, 0.015)$, atmospheric light $A$ estimated by the dark-channel prior). In the reverse direction, AOD-Net produces a dehazed view $I_{tf}$ from each foggy target image $I_t$.
